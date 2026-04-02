@@ -1,0 +1,19 @@
+{
+  "name": "mcp-server-discord-watcher",
+  "version": "0.1.0",
+  "description": "Discord channel watcher MCP server for Claude Code",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "lint": "bunx tsc --noEmit",
+    "test": "bun test",
+    "build": "scripts/ci/build.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "license": "MIT"
+}

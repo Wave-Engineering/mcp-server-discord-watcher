@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: sudo apt-get install -y shellcheck
+      - run: bun install
+      - run: scripts/ci/validate.sh
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - target: bun-linux-x64
+            runner: ubuntu-latest
+          - target: bun-linux-arm64
+            runner: ubuntu-latest
+          - target: bun-darwin-x64
+            runner: macos-latest
+          - target: bun-darwin-arm64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: scripts/ci/build.sh "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: discord-watcher-${{ matrix.target }}
+          path: dist/discord-watcher-*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: scripts/ci/release.sh "$TAG"
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}

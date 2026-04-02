@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "feature/*", "fix/*"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: sudo apt-get install -y shellcheck
+      - run: bun install
+      - run: scripts/ci/lint.sh
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: scripts/ci/test.sh
