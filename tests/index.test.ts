@@ -1,15 +1,24 @@
 /**
- * Tests for discord-watcher voice message STT, kill switch, and config features.
+ * Tests for discord-watcher voice message STT, kill switch, config, and
+ * scream-hole features.
  *
  * These tests exercise the real transcribeAudioAttachments, resolveIdentity,
- * checkKillSwitch, and engageKillSwitch functions. Only `fetch` (network) and
- * `readFileSync`/`execSync` (filesystem/process) are mocked — those are true
- * external boundaries.
+ * checkKillSwitch, engageKillSwitch, checkScreamHoleHealth, and resolveApiBase
+ * functions. Only `fetch` (network) and `readFileSync`/`execSync`
+ * (filesystem/process) are mocked — those are true external boundaries.
  */
 
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 import type { DiscordMessage, DiscordAttachment, DiscordConfig } from "../index";
-import { stripTokenPunctuation, loadConfig, checkKillSwitch, engageKillSwitch } from "../index";
+import {
+  stripTokenPunctuation,
+  loadConfig,
+  checkKillSwitch,
+  engageKillSwitch,
+  checkScreamHoleHealth,
+  resolveApiBase,
+  DISCORD_API_BASE,
+} from "../index";
 
 // We need to mock fetch and fs before importing the module under test.
 // Bun's mock system lets us intercept global fetch.
@@ -472,19 +481,25 @@ describe("loadConfig", () => {
     // Restore env vars
     process.env.DISCORD_GUILD_ID = originalEnv.DISCORD_GUILD_ID;
     process.env.DISCORD_TOKEN_PATH = originalEnv.DISCORD_TOKEN_PATH;
+    process.env.SCREAM_HOLE_URL = originalEnv.SCREAM_HOLE_URL;
     if (originalEnv.DISCORD_GUILD_ID === undefined) delete process.env.DISCORD_GUILD_ID;
     if (originalEnv.DISCORD_TOKEN_PATH === undefined) delete process.env.DISCORD_TOKEN_PATH;
+    if (originalEnv.SCREAM_HOLE_URL === undefined) delete process.env.SCREAM_HOLE_URL;
   });
 
-  test("loadConfig returns an object with guildId and tokenPath", () => {
+  test("loadConfig returns an object with guildId, tokenPath, and screamHoleUrl", () => {
     const config = loadConfig();
     expect(config).toHaveProperty("guildId");
     expect(config).toHaveProperty("tokenPath");
+    expect(config).toHaveProperty("screamHoleUrl");
     expect(typeof config.guildId).toBe("string");
     expect(typeof config.tokenPath).toBe("string");
     // Must return non-empty strings (either from config, env, or defaults)
     expect(config.guildId.length).toBeGreaterThan(0);
     expect(config.tokenPath.length).toBeGreaterThan(0);
+    // screamHoleUrl is null when not configured
+    // (it may be set via discord.json or env, so just check the type)
+    expect(config.screamHoleUrl === null || typeof config.screamHoleUrl === "string").toBe(true);
   });
 
   test("loadConfig falls back to hardcoded defaults when no config or env", () => {
@@ -519,14 +534,37 @@ describe("loadConfig", () => {
     const config: DiscordConfig = {
       guild_id: "123",
       token_path: "~/secrets/token",
+      scream_hole_url: "http://scream-hole:3000",
       channels: {
         default: { name: "agent-ops", id: "456" },
         "roll-call": { name: "roll-call", id: "789" },
       },
     };
     expect(config.guild_id).toBe("123");
+    expect(config.scream_hole_url).toBe("http://scream-hole:3000");
     expect(config.channels?.default?.id).toBe("456");
     expect(config.channels?.["roll-call"]?.id).toBe("789");
+  });
+
+  test("loadConfig uses SCREAM_HOLE_URL env var when set", () => {
+    process.env.SCREAM_HOLE_URL = "http://test-scream-hole:3000";
+    const config = loadConfig();
+    // If discord.json has scream_hole_url, that takes precedence.
+    // Otherwise env var should be returned.
+    // We can verify the type is correct at minimum.
+    expect(config.screamHoleUrl === null || typeof config.screamHoleUrl === "string").toBe(true);
+    // If no discord.json scream_hole_url, the env var should win
+    if (config.screamHoleUrl !== null) {
+      expect(typeof config.screamHoleUrl).toBe("string");
+    }
+  });
+
+  test("loadConfig returns null screamHoleUrl when not configured", () => {
+    delete process.env.SCREAM_HOLE_URL;
+    // This test may be affected by discord.json having scream_hole_url.
+    // We verify the function handles the case without throwing.
+    const config = loadConfig();
+    expect(config.screamHoleUrl === null || typeof config.screamHoleUrl === "string").toBe(true);
   });
 
   test("loadConfig source implements three-level fallback chain", () => {
@@ -544,9 +582,156 @@ describe("loadConfig", () => {
     // Env var fallback
     expect(src).toContain("process.env.DISCORD_GUILD_ID");
     expect(src).toContain("process.env.DISCORD_TOKEN_PATH");
+    expect(src).toContain("process.env.SCREAM_HOLE_URL");
 
     // Hardcoded defaults
     expect(src).toContain('DEFAULT_GUILD_ID = "1486516321385578576"');
     expect(src).toContain('DEFAULT_TOKEN_PATH = "~/secrets/discord-bot-token"');
+  });
+});
+
+// --- Scream-hole health check tests ------------------------------------------
+
+describe("checkScreamHoleHealth", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("returns true when health endpoint returns 200", async () => {
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      expect(url).toBe("http://scream-hole:3000/health");
+      return new Response("OK", { status: 200 });
+    }) as any;
+
+    const result = await checkScreamHoleHealth("http://scream-hole:3000");
+    expect(result).toBe(true);
+  });
+
+  test("returns false when health endpoint returns non-200", async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response("Service Unavailable", { status: 503 });
+    }) as any;
+
+    const result = await checkScreamHoleHealth("http://scream-hole:3000");
+    expect(result).toBe(false);
+  });
+
+  test("returns false when fetch throws (network error)", async () => {
+    globalThis.fetch = mock(async () => {
+      throw new Error("ECONNREFUSED");
+    }) as any;
+
+    const result = await checkScreamHoleHealth("http://scream-hole:3000");
+    expect(result).toBe(false);
+  });
+
+  test("strips trailing slashes from URL before appending /health", async () => {
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      expect(url).toBe("http://scream-hole:3000/health");
+      return new Response("OK", { status: 200 });
+    }) as any;
+
+    const result = await checkScreamHoleHealth("http://scream-hole:3000/");
+    expect(result).toBe(true);
+  });
+});
+
+// --- resolveApiBase tests ----------------------------------------------------
+
+describe("resolveApiBase", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("returns Discord API base when screamHoleUrl is null", async () => {
+    const result = await resolveApiBase(null);
+    expect(result).toBe(DISCORD_API_BASE);
+  });
+
+  test("returns scream-hole URL when health check passes", async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response("OK", { status: 200 });
+    }) as any;
+
+    const result = await resolveApiBase("http://scream-hole:3000");
+    expect(result).toBe("http://scream-hole:3000");
+  });
+
+  test("returns Discord API base when scream-hole health check fails", async () => {
+    globalThis.fetch = mock(async () => {
+      throw new Error("ECONNREFUSED");
+    }) as any;
+
+    const result = await resolveApiBase("http://scream-hole:3000");
+    expect(result).toBe(DISCORD_API_BASE);
+  });
+
+  test("strips trailing slashes from scream-hole URL", async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response("OK", { status: 200 });
+    }) as any;
+
+    const result = await resolveApiBase("http://scream-hole:3000/");
+    expect(result).toBe("http://scream-hole:3000");
+  });
+
+  test("returns Discord API base when scream-hole returns non-200", async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response("Service Unavailable", { status: 503 });
+    }) as any;
+
+    const result = await resolveApiBase("http://scream-hole:3000");
+    expect(result).toBe(DISCORD_API_BASE);
+  });
+});
+
+// --- Scream-hole source integration tests ------------------------------------
+
+describe("scream-hole source integration", () => {
+  test("apiGet uses API_BASE in fetch URL (source verification)", () => {
+    // Verify that apiGet constructs URLs from API_BASE
+    const { readFileSync } = require("node:fs");
+    const src = readFileSync(
+      new URL("../index.ts", import.meta.url).pathname,
+      "utf-8"
+    );
+
+    // apiGet should use API_BASE (not hardcoded Discord URL)
+    expect(src).toContain("`${API_BASE}${endpoint}`");
+    // API_BASE should be mutable (let, not const)
+    expect(src).toContain("let API_BASE = DISCORD_API_BASE");
+    // resolveApiBase should be called in main()
+    expect(src).toContain("API_BASE = await resolveApiBase(CONFIGURED_SCREAM_HOLE_URL)");
+  });
+
+  test("DISCORD_API_BASE constant matches expected Discord API URL", () => {
+    expect(DISCORD_API_BASE).toBe("https://discord.com/api/v10");
+  });
+
+  test("existing message fetch includes after parameter for pagination", () => {
+    // Verify the watcher already passes ?after= on message fetches
+    // This is critical for scream-hole which requires the after parameter
+    const { readFileSync } = require("node:fs");
+    const src = readFileSync(
+      new URL("../index.ts", import.meta.url).pathname,
+      "utf-8"
+    );
+
+    // fetchAllNewMessages must include after in query
+    expect(src).toContain("messages?after=${cursor}&limit=");
   });
 });

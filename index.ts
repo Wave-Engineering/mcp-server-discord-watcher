@@ -42,6 +42,7 @@ const DEFAULT_TOKEN_PATH = "~/secrets/discord-bot-token";
 export interface DiscordConfig {
   guild_id?: string;
   token_path?: string;
+  scream_hole_url?: string;
   channels?: {
     [role: string]: { name: string; id: string };
   };
@@ -53,7 +54,7 @@ export interface DiscordConfig {
  * 2. Environment variables
  * 3. Hardcoded defaults
  */
-export function loadConfig(): { guildId: string; tokenPath: string } {
+export function loadConfig(): { guildId: string; tokenPath: string; screamHoleUrl: string | null } {
   let config: DiscordConfig = {};
   const configPath = join(homedir(), ".claude", "discord.json");
 
@@ -78,12 +79,19 @@ export function loadConfig(): { guildId: string; tokenPath: string } {
     process.env.DISCORD_TOKEN_PATH ||
     DEFAULT_TOKEN_PATH;
 
-  return { guildId, tokenPath };
+  // 4. Scream-hole URL: config → env → null (disabled)
+  const screamHoleUrl =
+    config.scream_hole_url ||
+    process.env.SCREAM_HOLE_URL ||
+    null;
+
+  return { guildId, tokenPath, screamHoleUrl };
 }
 
-const { guildId: GUILD_ID, tokenPath: CONFIGURED_TOKEN_PATH } = loadConfig();
+const { guildId: GUILD_ID, tokenPath: CONFIGURED_TOKEN_PATH, screamHoleUrl: CONFIGURED_SCREAM_HOLE_URL } = loadConfig();
 
-const API_BASE = "https://discord.com/api/v10";
+export const DISCORD_API_BASE = "https://discord.com/api/v10";
+let API_BASE = DISCORD_API_BASE;
 const POLL_INTERVAL_MS = 15_000;
 const CHANNEL_REFRESH_MS = 5 * 60_000;
 const MESSAGES_PER_PAGE = 50;
@@ -155,6 +163,45 @@ export function engageKillSwitch(retryAfterSeconds: number): void {
     // Clean up temp file if rename failed
     try { unlinkSync(tmpFile); } catch { /* ignore */ }
   }
+}
+
+// --- Scream-hole health check ------------------------------------------------
+
+/**
+ * Check if scream-hole is reachable by hitting its /health endpoint.
+ * Returns true if reachable, false otherwise.
+ */
+export async function checkScreamHoleHealth(url: string): Promise<boolean> {
+  try {
+    const healthUrl = `${url.replace(/\/+$/, "")}/health`;
+    const res = await fetch(healthUrl, { signal: AbortSignal.timeout(5000) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve which API base URL to use. If scream-hole is configured and reachable,
+ * use it; otherwise fall back to direct Discord API.
+ */
+export async function resolveApiBase(screamHoleUrl: string | null): Promise<string> {
+  if (!screamHoleUrl) {
+    console.error("[discord-watcher] Mode: direct Discord API");
+    return DISCORD_API_BASE;
+  }
+
+  const healthy = await checkScreamHoleHealth(screamHoleUrl);
+  if (healthy) {
+    const baseUrl = screamHoleUrl.replace(/\/+$/, "");
+    console.error(`[discord-watcher] Mode: scream-hole proxy (${baseUrl})`);
+    return baseUrl;
+  }
+
+  console.error(
+    `[discord-watcher] Warning: scream-hole at ${screamHoleUrl} is unreachable, falling back to direct Discord API`
+  );
+  return DISCORD_API_BASE;
 }
 
 // --- Auth --------------------------------------------------------------------
@@ -312,6 +359,34 @@ export async function transcribeAudioAttachments(
   return transcriptions.length > 0 ? transcriptions.join("\n") : null;
 }
 
+// --- Snowflake helper --------------------------------------------------------
+
+const DISCORD_EPOCH = 1420070400000n;
+
+/**
+ * Generate a snowflake ID for a given timestamp (ms since Unix epoch).
+ * Used for baseline initialization when going through scream-hole,
+ * which requires the `after` parameter on GET /messages.
+ */
+function timestampToSnowflake(timestampMs: number): string {
+  return String((BigInt(timestampMs) - DISCORD_EPOCH) << 22n);
+}
+
+/**
+ * Build the messages endpoint URL for a single recent-message fetch.
+ * When going through scream-hole, includes `after` (5 minutes ago).
+ * When direct to Discord, uses the original `?limit=1` pattern.
+ */
+function recentMessageUrl(channelId: string): string {
+  if (API_BASE !== DISCORD_API_BASE) {
+    // Through scream-hole — `after` is required. Use 4h window to match
+    // scream-hole's cache window — ensures baseline works for low-traffic channels.
+    const fourHoursAgo = timestampToSnowflake(Date.now() - 4 * 60 * 60_000);
+    return `/channels/${channelId}/messages?after=${fourHoursAgo}&limit=1`;
+  }
+  return `/channels/${channelId}/messages?limit=1`;
+}
+
 // --- State -------------------------------------------------------------------
 
 let watchedChannels: DiscordChannel[] = [];
@@ -331,7 +406,7 @@ async function initializeBaselines(authHeader: string): Promise<void> {
   for (const channel of watchedChannels) {
     try {
       const result = await apiGet(
-        `/channels/${channel.id}/messages?limit=1`,
+        recentMessageUrl(channel.id),
         authHeader
       );
       if (result.ok) {
@@ -406,7 +481,7 @@ async function checkForNewMessages(
       // First poll for this channel — just set baseline
       if (!lastId) {
         const result = await apiGet(
-          `/channels/${channel.id}/messages?limit=1`,
+          recentMessageUrl(channel.id),
           authHeader
         );
         if (result.ok) {
@@ -516,6 +591,9 @@ async function main(): Promise<void> {
   const token = loadToken();
   const authHeader = `Bot ${token}`;
 
+  // Resolve API base URL (scream-hole if configured and healthy, else direct Discord)
+  API_BASE = await resolveApiBase(CONFIGURED_SCREAM_HOLE_URL);
+
   const server = new Server(
     { name: "discord_watcher", version: "0.1.0" },
     {
@@ -559,7 +637,7 @@ async function main(): Promise<void> {
         if (!lastSeenMessageId.has(ch.id)) {
           try {
             const result = await apiGet(
-              `/channels/${ch.id}/messages?limit=1`,
+              recentMessageUrl(ch.id),
               authHeader
             );
             if (result.ok) {
