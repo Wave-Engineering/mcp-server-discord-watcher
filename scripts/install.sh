@@ -66,6 +66,7 @@ install_deps() {
 
 register_mcp() {
     info "Registering MCP server: $MCP_SERVER_NAME"
+    claude mcp remove "$MCP_SERVER_NAME" 2>/dev/null || true
     claude mcp add --scope user --transport stdio "$MCP_SERVER_NAME" \
         -- bun "$MCP_DIR/index.ts"
     ok "MCP server registered (scope: user)"
