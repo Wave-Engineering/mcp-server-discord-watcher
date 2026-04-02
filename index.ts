@@ -596,7 +596,10 @@ async function main(): Promise<void> {
   });
 }
 
-main().catch((err) => {
-  console.error(`[discord-watcher] Fatal: ${err}`);
-  process.exit(1);
-});
+// Only run when executed directly (not when imported by tests)
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(`[discord-watcher] Fatal: ${err}`);
+    process.exit(1);
+  });
+}
