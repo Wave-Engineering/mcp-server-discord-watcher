@@ -4,3 +4,9 @@ dist/
 .env.*
 *.tsbuildinfo
 .buildinfo
+
+# Claude Code session ephemera
+# .claude/  — context-state journals, crystallizer log, agent identity
+# .wtf/     — wtf-skill troubleshooting hook queue
+.claude/
+.wtf/
