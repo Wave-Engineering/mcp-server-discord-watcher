@@ -345,6 +345,43 @@ describe("DiscordMessage with attachments", () => {
   });
 });
 
+// --- MCP INSTRUCTIONS string tests -------------------------------------------
+//
+// Regression suite for issue #3. The watcher's MCP `instructions` string is
+// surfaced to every Claude Code session that loads the watcher as system-
+// reminder context, telling agents how to read and reply to Discord messages.
+// Originally it told agents to run a `discord-bot` shell CLI that does not
+// exist. The fix points agents at the disc_read / disc_send MCP tools from
+// the sibling disc-server MCP, which IS available in any session that loads
+// the watcher.
+//
+// These tests are source-reading checks because INSTRUCTIONS is a private
+// const inside index.ts, not an exported value. They lock in the contract:
+// the new MCP tool references must be present, and the broken CLI references
+// must NOT regress.
+
+describe("MCP server INSTRUCTIONS string", () => {
+  test("references disc_read and disc_send MCP tools, not discord-bot CLI", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(
+      new URL("../index.ts", import.meta.url).pathname,
+      "utf-8"
+    );
+
+    // Old broken CLI references must NOT regress
+    expect(src).not.toContain("discord-bot read");
+    expect(src).not.toContain("discord-bot send");
+
+    // New MCP tool references must be present
+    expect(src).toContain("disc_read");
+    expect(src).toContain("disc_send");
+
+    // The MCP server name should be mentioned so agents know where the tools
+    // come from (helps disambiguate from other Discord MCP servers)
+    expect(src).toContain("disc-server");
+  });
+});
+
 // --- STT configuration tests -------------------------------------------------
 
 describe("STT configuration", () => {
