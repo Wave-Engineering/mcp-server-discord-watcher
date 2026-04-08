@@ -19,6 +19,8 @@ import {
   resolveApiBase,
   shouldDeliverMessage,
   isReplyToOurSignature,
+  nextChannelJitterMs,
+  refreshChannelList,
   DISCORD_API_BASE,
 } from "../index";
 import type { AgentIdentity } from "../index";
@@ -661,6 +663,106 @@ describe("isReplyToOurSignature", () => {
       }),
     });
     expect(isReplyToOurSignature(msg, identity)).toBe(true);
+  });
+});
+
+// --- Polling rate-limit hygiene tests ----------------------------------------
+//
+// Regression suite for issue #9. Two fixes:
+//   1. Inter-channel jitter — checkForNewMessages now sleeps a random
+//      50-150ms between channel polls to spread API calls across the cycle
+//   2. Kill-switch-aware refresh — the channel refresh setInterval now
+//      short-circuits when the kill switch is active, instead of independently
+//      re-bursting the API while the main poll loop is paused
+
+describe("nextChannelJitterMs", () => {
+  test("returns a value in [50, 150) for many samples", () => {
+    // Sample 200 times to get good distribution coverage
+    for (let i = 0; i < 200; i++) {
+      const ms = nextChannelJitterMs();
+      expect(ms).toBeGreaterThanOrEqual(50);
+      expect(ms).toBeLessThan(150);
+    }
+  });
+
+  test("produces variation across calls (not a constant)", () => {
+    // Verify the function actually randomizes — not stuck on a single value
+    const samples = new Set<number>();
+    for (let i = 0; i < 50; i++) {
+      samples.add(nextChannelJitterMs());
+    }
+    // With Math.random producing 50 doubles in [50,150), we should get
+    // far more than a handful of distinct values. Loose bound to avoid flakes.
+    expect(samples.size).toBeGreaterThan(10);
+  });
+});
+
+describe("refreshChannelList", () => {
+  let originalFetch: typeof globalThis.fetch;
+  const KILL_FILE = `${process.env.HOME}/.claude/discord-bot.kill`;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(async () => {
+    globalThis.fetch = originalFetch;
+    const { unlinkSync } = await import("node:fs");
+    try { unlinkSync(KILL_FILE); } catch { /* ignore */ }
+  });
+
+  test("returns early without calling fetch when kill switch is active", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(`${process.env.HOME}/.claude`, { recursive: true });
+    writeFileSync(KILL_FILE, ""); // empty file = manual kill, always active
+
+    let fetchCallCount = 0;
+    globalThis.fetch = mock(async () => {
+      fetchCallCount++;
+      return new Response("[]", { status: 200 });
+    }) as any;
+
+    await refreshChannelList("Bot fake-token");
+
+    // The kill switch must short-circuit BEFORE any outbound API call.
+    // This is the load-bearing assertion: the bug allowed the refresh
+    // timer to fire during cooldown and re-burst the API.
+    expect(fetchCallCount).toBe(0);
+  });
+
+  test("returns early when kill switch has a future expiry timestamp", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(`${process.env.HOME}/.claude`, { recursive: true });
+    const futureTs = Math.floor(Date.now() / 1000) + 3600; // +1 hour
+    writeFileSync(KILL_FILE, `${futureTs}\n`);
+
+    let fetchCallCount = 0;
+    globalThis.fetch = mock(async () => {
+      fetchCallCount++;
+      return new Response("[]", { status: 200 });
+    }) as any;
+
+    await refreshChannelList("Bot fake-token");
+
+    expect(fetchCallCount).toBe(0);
+  });
+
+  test("calls fetchTextChannels when kill switch is clear", async () => {
+    // Ensure no kill file exists
+    const { unlinkSync } = await import("node:fs");
+    try { unlinkSync(KILL_FILE); } catch { /* ignore */ }
+
+    let fetchCallCount = 0;
+    globalThis.fetch = mock(async () => {
+      fetchCallCount++;
+      // Return an empty channel list — simplest happy path
+      return new Response("[]", { status: 200 });
+    }) as any;
+
+    await refreshChannelList("Bot fake-token");
+
+    // At least the /guilds/<id>/channels call should have fired
+    expect(fetchCallCount).toBeGreaterThan(0);
   });
 });
 
