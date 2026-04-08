@@ -6,7 +6,8 @@
  * wake-up notifications into the Claude Code session when new messages arrive.
  *
  * This is a "doorbell, not a mailroom" — it notifies the agent that something
- * new appeared, then the agent uses discord-bot read/send to interact.
+ * new appeared, then the agent uses the disc_read / disc_send MCP tools (from
+ * the disc-server MCP server) to interact.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -732,8 +733,8 @@ const INSTRUCTIONS = [
   'Discord messages arrive as <channel source="discord_watcher" channel_name="..." channel_id="..." author="...">.',
   "Messages are pre-filtered: you only receive messages addressed to @all, @<Dev-Team>, @<Dev-Name>, or replies to messages you signed.",
   "When you see a notification:",
-  "1. Run: discord-bot read <channel_id> --limit 10",
-  "2. Process the message and respond via discord-bot send if action is needed.",
+  "1. Call the mcp__disc-server__disc_read tool with channel_id and limit: 10 to fetch recent messages in context.",
+  "2. Process the message and respond by calling mcp__disc-server__disc_send if action is needed.",
   '3. Sign every message with: — **<dev-name>** <dev-avatar> (<dev-team>). The watcher filters your own echoes by this signature, and uses it to route replies back to you.',
 ].join("\n");
 

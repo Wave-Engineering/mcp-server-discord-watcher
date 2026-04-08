@@ -5,7 +5,8 @@ on a Discord server and pushes wake-up notifications into the Claude Code
 session when new messages arrive.
 
 This is a "doorbell, not a mailroom" — it notifies the agent that something new
-appeared, then the agent uses `discord-bot read/send` to interact.
+appeared, then the agent uses the `disc_read` and `disc_send` MCP tools (from
+the `disc-server` MCP server) to interact.
 
 ## Prerequisites
 
