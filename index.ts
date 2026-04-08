@@ -294,6 +294,13 @@ export interface DiscordMessage {
   content: string;
   timestamp: string;
   attachments?: DiscordAttachment[];
+  /**
+   * Populated by Discord when this message is a reply (type 19). Contains the
+   * parent message object so the watcher can route replies to whoever signed
+   * the parent, even when the reply text doesn't include an @<dev-name> token.
+   * `null` when the parent has been deleted.
+   */
+  referenced_message?: DiscordMessage | null;
 }
 
 // --- Voice message STT -------------------------------------------------------
@@ -301,6 +308,103 @@ export interface DiscordMessage {
 /** Strip punctuation from a lowercased token, keeping only routing-key chars. */
 export function stripTokenPunctuation(token: string): string {
   return token.replace(/[^a-z0-9@_-]/g, "");
+}
+
+/**
+ * Strip fenced code blocks and inline code spans from a markdown string.
+ * Used to prevent false-positive signature matches when a message quotes
+ * the signature format in a code block (e.g. "the format is `— **morpheus**`").
+ */
+function stripMarkdownCode(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, "") // fenced code blocks
+    .replace(/`[^`\n]*`/g, "");     // inline code spans
+}
+
+/**
+ * Check whether a message is a reply to another message we (the current
+ * agent identity) signed. Looks at `referenced_message.content` for the
+ * signature pattern `— **<dev-name>**` (case-insensitive), with markdown
+ * code blocks and inline code spans stripped first to avoid false positives
+ * from quoted signature examples.
+ *
+ * Replies in Discord carry their addressing in `referenced_message`, not in
+ * the reply's text content. Without this check, a reply like "good point" to
+ * a message we just posted would be silently dropped by the token-based
+ * filter — even though Discord's UI clearly shows it as directed at us.
+ */
+export function isReplyToOurSignature(
+  msg: DiscordMessage,
+  identity: AgentIdentity
+): boolean {
+  const parent = msg.referenced_message;
+  if (!parent || !parent.content || !identity.devName) return false;
+  const cleaned = stripMarkdownCode(parent.content).toLowerCase();
+  return cleaned.includes(`— **${identity.devName.toLowerCase()}**`);
+}
+
+/**
+ * Pure-function targeted routing filter. Returns true if the message should
+ * be delivered as a wake-up notification to the current agent, false otherwise.
+ *
+ * Decision order (the fail-closed identity check intentionally precedes
+ * VERBOSE so that an unattributed agent gets nothing even in verbose mode —
+ * VERBOSE bypasses targeted routing, not security boundaries):
+ *   1. Empty messages (no content, no attachments) → drop
+ *   2. Self-echo (message contains our own signature) → drop
+ *   3. Identity unresolved (no devName, no devTeam) → drop (fail closed,
+ *      prevents cross-project leakage to unattributed sessions)
+ *   4. VERBOSE mode bypasses targeted routing → deliver
+ *   5. Addressed via @all, @<dev-team>, @<dev-name>, or reply to a message
+ *      we signed → deliver
+ *   6. Otherwise → drop
+ */
+export function shouldDeliverMessage(
+  msg: DiscordMessage,
+  identity: AgentIdentity,
+  options: { verbose?: boolean } = {}
+): boolean {
+  // 1. Skip empty messages (e.g. bot embeds, sticker-only)
+  if (!msg.content.trim() && !msg.attachments?.length) {
+    return false;
+  }
+
+  // 2. Self-echo filter — drop messages containing our own signature
+  if (
+    identity.devName &&
+    msg.content
+      .toLowerCase()
+      .includes(`— **${identity.devName.toLowerCase()}**`)
+  ) {
+    return false;
+  }
+
+  // 3. Fail closed when identity is unresolved (precedes VERBOSE so the
+  // security boundary is preserved even in verbose mode)
+  if (!identity.devName && !identity.devTeam) {
+    return false;
+  }
+
+  // 4. VERBOSE mode bypasses targeted routing entirely
+  if (options.verbose) {
+    return true;
+  }
+
+  // 5. Token-based addressing
+  const tokens = msg.content
+    .toLowerCase()
+    .split(/\s+/)
+    .map(stripTokenPunctuation);
+  const isAddressedToAll = tokens.includes("@all");
+  const isAddressedToTeam = identity.devTeam
+    ? tokens.includes(`@${identity.devTeam.toLowerCase()}`)
+    : false;
+  const isAddressedToMe = identity.devName
+    ? tokens.includes(`@${identity.devName.toLowerCase()}`)
+    : false;
+  const replyToUs = isReplyToOurSignature(msg, identity);
+
+  return isAddressedToAll || isAddressedToTeam || isAddressedToMe || replyToUs;
 }
 
 const STT_ENDPOINT = process.env.STT_ENDPOINT ?? "http://archer:8300/v1/audio/transcriptions";
@@ -505,37 +609,8 @@ async function checkForNewMessages(
 
       // Push a wake-up notification for each new message (oldest first)
       for (const msg of messages.reverse()) {
-        // Skip messages with no text and no attachments (e.g. bot embeds)
-        if (!msg.content.trim() && !msg.attachments?.length) {
+        if (!shouldDeliverMessage(msg, cachedIdentity, { verbose: VERBOSE })) {
           continue;
-        }
-
-        // Self-echo filter: skip messages containing our own signature (case-insensitive)
-        if (cachedIdentity.devName &&
-            msg.content.toLowerCase().includes(`— **${cachedIdentity.devName.toLowerCase()}**`)) {
-          continue;
-        }
-
-        // Targeted filtering (unless VERBOSE mode bypasses it)
-        if (!VERBOSE) {
-          // If identity hasn't been set yet, fail open — deliver the message
-          if (!cachedIdentity.devName && !cachedIdentity.devTeam) {
-            // No identity resolved yet — deliver all messages until agent sets up
-          } else {
-            const contentLower = msg.content.toLowerCase();
-            const tokens = contentLower.split(/\s+/).map(stripTokenPunctuation);
-            const isAddressedToAll = tokens.includes("@all");
-            const isAddressedToTeam = cachedIdentity.devTeam
-              ? tokens.includes(`@${cachedIdentity.devTeam.toLowerCase()}`)
-              : false;
-            const isAddressedToMe = cachedIdentity.devName
-              ? tokens.includes(`@${cachedIdentity.devName.toLowerCase()}`)
-              : false;
-
-            if (!isAddressedToAll && !isAddressedToTeam && !isAddressedToMe) {
-              continue;
-            }
-          }
         }
 
         // Transcribe audio attachments if present
@@ -579,11 +654,11 @@ async function checkForNewMessages(
 
 const INSTRUCTIONS = [
   'Discord messages arrive as <channel source="discord_watcher" channel_name="..." channel_id="..." author="...">.',
-  "Messages are pre-filtered: you only receive messages addressed to @all, @<Dev-Team>, or @<Dev-Name>.",
+  "Messages are pre-filtered: you only receive messages addressed to @all, @<Dev-Team>, @<Dev-Name>, or replies to messages you signed.",
   "When you see a notification:",
   "1. Run: discord-bot read <channel_id> --limit 10",
   "2. Process the message and respond via discord-bot send if action is needed.",
-  '3. Sign every message with: — **<dev-name>** <dev-avatar> (<dev-team>). The watcher filters your own echoes by this signature.',
+  '3. Sign every message with: — **<dev-name>** <dev-avatar> (<dev-team>). The watcher filters your own echoes by this signature, and uses it to route replies back to you.',
 ].join("\n");
 
 async function main(): Promise<void> {
