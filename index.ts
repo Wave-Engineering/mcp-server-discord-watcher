@@ -97,6 +97,13 @@ const CHANNEL_REFRESH_MS = 5 * 60_000;
 const MESSAGES_PER_PAGE = 50;
 const VERBOSE = process.env.DISCORD_WATCHER_VERBOSE === "1";
 
+// Random delay between per-channel polls within a single cycle. Spreads
+// outbound Discord API calls across the cycle window so guilds with many
+// channels don't fire 20+ requests in a tight burst that trips the global
+// rate limit.
+const INTER_CHANNEL_JITTER_MIN_MS = 50;
+const INTER_CHANNEL_JITTER_MAX_MS = 150;
+
 // --- Kill switch -------------------------------------------------------------
 
 const KILL_FILE = join(homedir(), ".claude", "discord-bot.kill");
@@ -527,6 +534,25 @@ async function initializeBaselines(authHeader: string): Promise<void> {
 
 // --- Polling -----------------------------------------------------------------
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Returns a random delay (in milliseconds) to insert between per-channel
+ * polls in a single cycle. Used to spread Discord API calls and avoid the
+ * tight-burst pattern that can trip global rate limits on guilds with many
+ * channels.
+ *
+ * Range: [INTER_CHANNEL_JITTER_MIN_MS, INTER_CHANNEL_JITTER_MAX_MS).
+ */
+export function nextChannelJitterMs(): number {
+  return (
+    INTER_CHANNEL_JITTER_MIN_MS +
+    Math.random() * (INTER_CHANNEL_JITTER_MAX_MS - INTER_CHANNEL_JITTER_MIN_MS)
+  );
+}
+
 async function fetchAllNewMessages(
   channelId: string,
   afterId: string,
@@ -568,6 +594,45 @@ async function fetchAllNewMessages(
   return allMessages;
 }
 
+/**
+ * Refresh the watched channel list. Honors the kill switch — when the
+ * watcher is in cooldown after a 429, this is a no-op so the refresh
+ * timer doesn't independently re-burst the API while the main poll loop
+ * is paused.
+ *
+ * Mutates module-level `watchedChannels` and `lastSeenMessageId` on
+ * successful refresh. Exported so the kill-switch short-circuit can be
+ * exercised in unit tests.
+ */
+export async function refreshChannelList(authHeader: string): Promise<void> {
+  if (checkKillSwitch() === "active") return;
+
+  const fresh = await fetchTextChannels(authHeader);
+  for (const ch of fresh) {
+    // Re-check kill switch between baseline calls — if a baseline
+    // request inside this loop trips a 429 and engages the kill switch,
+    // we should stop firing more requests in the same refresh cycle
+    // rather than continue bursting through every newly discovered channel.
+    if (checkKillSwitch() === "active") break;
+
+    if (!lastSeenMessageId.has(ch.id)) {
+      try {
+        const result = await apiGet(recentMessageUrl(ch.id), authHeader);
+        if (result.ok) {
+          const msgs = result.data as DiscordMessage[];
+          if (msgs.length > 0) {
+            lastSeenMessageId.set(ch.id, msgs[0].id);
+          }
+        }
+      } catch {
+        // skip unreadable
+      }
+    }
+  }
+  watchedChannels = fresh;
+  console.error(`[discord-watcher] Refreshed: ${fresh.length} channels`);
+}
+
 async function checkForNewMessages(
   server: Server,
   authHeader: string
@@ -578,7 +643,18 @@ async function checkForNewMessages(
   // Refresh identity each cycle (agent may pick name after server starts)
   cachedIdentity = resolveIdentity();
 
+  let isFirstChannel = true;
   for (const channel of watchedChannels) {
+    // Inter-channel jitter — spread outbound API calls across the cycle
+    // window so guilds with many channels don't fire 20+ requests in a
+    // tight burst. Skipped on the first channel (no preceding work) and
+    // applied via top-of-loop placement so it covers ALL code paths in
+    // the iteration body, including the early `continue`s below.
+    if (!isFirstChannel) {
+      await sleep(nextChannelJitterMs());
+    }
+    isFirstChannel = false;
+
     try {
       const lastId = lastSeenMessageId.get(channel.id);
 
@@ -704,35 +780,12 @@ async function main(): Promise<void> {
     POLL_INTERVAL_MS
   );
 
-  // Periodically refresh the channel list
-  const refreshTimer = setInterval(async () => {
-    try {
-      const fresh = await fetchTextChannels(authHeader);
-      for (const ch of fresh) {
-        if (!lastSeenMessageId.has(ch.id)) {
-          try {
-            const result = await apiGet(
-              recentMessageUrl(ch.id),
-              authHeader
-            );
-            if (result.ok) {
-              const msgs = result.data as DiscordMessage[];
-              if (msgs.length > 0) {
-                lastSeenMessageId.set(ch.id, msgs[0].id);
-              }
-            }
-          } catch {
-            // skip unreadable
-          }
-        }
-      }
-      watchedChannels = fresh;
-      console.error(
-        `[discord-watcher] Refreshed: ${fresh.length} channels`
-      );
-    } catch (err) {
+  // Periodically refresh the channel list (honors kill switch via
+  // refreshChannelList — see its docstring)
+  const refreshTimer = setInterval(() => {
+    refreshChannelList(authHeader).catch((err) => {
       console.error(`[discord-watcher] Channel refresh failed: ${err}`);
-    }
+    });
   }, CHANNEL_REFRESH_MS);
 
   // Clean up on exit
