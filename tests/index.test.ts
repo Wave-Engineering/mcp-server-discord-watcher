@@ -17,8 +17,11 @@ import {
   engageKillSwitch,
   checkScreamHoleHealth,
   resolveApiBase,
+  shouldDeliverMessage,
+  isReplyToOurSignature,
   DISCORD_API_BASE,
 } from "../index";
+import type { AgentIdentity } from "../index";
 
 // We need to mock fetch and fs before importing the module under test.
 // Bun's mock system lets us intercept global fetch.
@@ -391,6 +394,273 @@ describe("addressing", () => {
     expect(tokens).toContain("@echo-chamber");
     expect(tokens).toContain("@all");
     expect(tokens).toContain("@cc-workflow");
+  });
+});
+
+// --- shouldDeliverMessage / isReplyToOurSignature tests ---------------------
+//
+// Filter-correctness regression suite for issue #10. Both fixes:
+//   1. Fail-closed when identity is unresolved (was: fail-open, leaked
+//      cross-project messages to unattributed sessions)
+//   2. Reply-routing via referenced_message signature match (was: replies
+//      with no @-mention in their text were silently dropped)
+
+describe("shouldDeliverMessage", () => {
+  const identity = (overrides: Partial<AgentIdentity> = {}): AgentIdentity => ({
+    devName: "morpheus",
+    devTeam: "mcp-server-discord-watcher",
+    ...overrides,
+  });
+
+  test("delivers message addressed to @<dev-name>", () => {
+    const msg = makeMsg({ content: "hey @morpheus check this" });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
+  test("delivers message addressed to @<dev-team>", () => {
+    const msg = makeMsg({ content: "hey @mcp-server-discord-watcher ship it" });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
+  test("delivers message addressed to @all", () => {
+    const msg = makeMsg({ content: "@all standup in 5" });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
+  test("addressing matches even with trailing punctuation", () => {
+    const msg = makeMsg({ content: "@morpheus, can you look at this?" });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
+  test("drops unaddressed message when identity is set", () => {
+    const msg = makeMsg({ content: "random chatter with no addressing" });
+    expect(shouldDeliverMessage(msg, identity())).toBe(false);
+  });
+
+  test("drops empty message (no content, no attachments)", () => {
+    const msg = makeMsg({ content: "" });
+    expect(shouldDeliverMessage(msg, identity())).toBe(false);
+  });
+
+  test("delivers message with audio attachment even if content is empty", () => {
+    const msg = makeMsg({
+      content: "@morpheus listen to this",
+      attachments: [
+        {
+          id: "a1",
+          filename: "voice.ogg",
+          content_type: "audio/ogg",
+          url: "https://example.com/voice.ogg",
+          size: 1024,
+        },
+      ],
+    });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
+  // --- Bug 1 fix: fail-closed when identity unresolved ---
+
+  test("FAIL CLOSED: drops message when both devName and devTeam are null", () => {
+    const msg = makeMsg({ content: "@some-other-agent please help" });
+    const noIdentity = { devName: null, devTeam: null };
+    expect(shouldDeliverMessage(msg, noIdentity)).toBe(false);
+  });
+
+  test("FAIL CLOSED: drops even @all when identity is unresolved", () => {
+    // The most surprising case: even broadcasts fail closed for unidentified
+    // agents. Better silence than cross-project leakage.
+    const msg = makeMsg({ content: "@all standup in 5" });
+    const noIdentity = { devName: null, devTeam: null };
+    expect(shouldDeliverMessage(msg, noIdentity)).toBe(false);
+  });
+
+  test("FAIL CLOSED: still delivers when at least devTeam is resolved", () => {
+    const msg = makeMsg({ content: "@my-team ship it" });
+    const partialIdentity = { devName: null, devTeam: "my-team" };
+    expect(shouldDeliverMessage(msg, partialIdentity)).toBe(true);
+  });
+
+  // --- Self-echo filter still works ---
+
+  test("self-echo: drops messages containing our own signature", () => {
+    const msg = makeMsg({
+      content: "did the thing — **morpheus** 💊 (mcp-server-discord-watcher)",
+    });
+    expect(shouldDeliverMessage(msg, identity())).toBe(false);
+  });
+
+  test("self-echo is case-insensitive", () => {
+    const msg = makeMsg({ content: "did the thing — **MORPHEUS** 💊" });
+    expect(shouldDeliverMessage(msg, identity())).toBe(false);
+  });
+
+  // --- VERBOSE mode ---
+
+  test("VERBOSE bypasses targeted routing", () => {
+    const msg = makeMsg({ content: "random chatter" });
+    expect(shouldDeliverMessage(msg, identity(), { verbose: true })).toBe(true);
+  });
+
+  test("VERBOSE still applies self-echo filter", () => {
+    const msg = makeMsg({ content: "echo — **morpheus** 💊" });
+    expect(shouldDeliverMessage(msg, identity(), { verbose: true })).toBe(false);
+  });
+
+  test("VERBOSE still applies empty-message filter", () => {
+    const msg = makeMsg({ content: "" });
+    expect(shouldDeliverMessage(msg, identity(), { verbose: true })).toBe(false);
+  });
+
+  test("FAIL CLOSED takes precedence over VERBOSE", () => {
+    // VERBOSE bypasses targeted routing, NOT the security boundary.
+    // An unattributed agent must not receive cross-project traffic just
+    // because someone set DISCORD_WATCHER_VERBOSE=1.
+    const msg = makeMsg({ content: "@all standup in 5" });
+    const noIdentity = { devName: null, devTeam: null };
+    expect(shouldDeliverMessage(msg, noIdentity, { verbose: true })).toBe(false);
+  });
+
+  // --- Bug 2 fix: reply routing via referenced_message ---
+
+  test("REPLY-ROUTING: delivers reply to a message we signed", () => {
+    const msg = makeMsg({
+      content: "good point",
+      referenced_message: makeMsg({
+        id: "parent-1",
+        content: "the fix is at index.ts:520. — **morpheus** 💊 (mcp-server-discord-watcher)",
+      }),
+    });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
+  test("REPLY-ROUTING: does not deliver reply to someone else's message", () => {
+    const msg = makeMsg({
+      content: "thanks",
+      referenced_message: makeMsg({
+        id: "parent-1",
+        content: "fix landed. — **cacodemon** 👁️ (mcp-server-nerf)",
+      }),
+    });
+    expect(shouldDeliverMessage(msg, identity())).toBe(false);
+  });
+
+  test("REPLY-ROUTING is case-insensitive", () => {
+    const msg = makeMsg({
+      content: "got it",
+      referenced_message: makeMsg({
+        id: "parent-1",
+        content: "look here — **MORPHEUS** 💊",
+      }),
+    });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
+  test("REPLY-ROUTING: missing referenced_message is harmless", () => {
+    const msg = makeMsg({ content: "no reference" });
+    // Same as the unaddressed-drop case
+    expect(shouldDeliverMessage(msg, identity())).toBe(false);
+  });
+
+  test("REPLY-ROUTING: null referenced_message (parent deleted) is harmless", () => {
+    const msg = makeMsg({ content: "no reference", referenced_message: null });
+    expect(shouldDeliverMessage(msg, identity())).toBe(false);
+  });
+
+  test("REPLY-ROUTING: delivers when reply is also addressed to a third party", () => {
+    // Documented intent: a reply to one of our messages is for us, even if
+    // the reply text mentions someone else by name. Discord's threading
+    // model puts the sender in conversation with the parent's author.
+    const msg = makeMsg({
+      content: "@cacodemon you should see this too",
+      referenced_message: makeMsg({
+        id: "parent-1",
+        content: "the fix landed — **morpheus** 💊 (mcp-server-discord-watcher)",
+      }),
+    });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+});
+
+describe("isReplyToOurSignature", () => {
+  const identity: AgentIdentity = {
+    devName: "morpheus",
+    devTeam: "mcp-server-discord-watcher",
+  };
+
+  test("returns false when message has no referenced_message", () => {
+    const msg = makeMsg({ content: "hi" });
+    expect(isReplyToOurSignature(msg, identity)).toBe(false);
+  });
+
+  test("returns false when referenced_message is null", () => {
+    const msg = makeMsg({ content: "hi", referenced_message: null });
+    expect(isReplyToOurSignature(msg, identity)).toBe(false);
+  });
+
+  test("returns false when referenced_message has empty content", () => {
+    const msg = makeMsg({
+      content: "hi",
+      referenced_message: makeMsg({ content: "" }),
+    });
+    expect(isReplyToOurSignature(msg, identity)).toBe(false);
+  });
+
+  test("returns false when identity has no devName", () => {
+    const msg = makeMsg({
+      content: "hi",
+      referenced_message: makeMsg({ content: "— **morpheus** 💊" }),
+    });
+    expect(isReplyToOurSignature(msg, { devName: null, devTeam: "team" })).toBe(false);
+  });
+
+  test("returns true when parent contains our signature", () => {
+    const msg = makeMsg({
+      content: "hi",
+      referenced_message: makeMsg({
+        content: "look at this — **morpheus** 💊 (team)",
+      }),
+    });
+    expect(isReplyToOurSignature(msg, identity)).toBe(true);
+  });
+
+  test("does not match a partial signature without the em-dash prefix", () => {
+    const msg = makeMsg({
+      content: "hi",
+      referenced_message: makeMsg({ content: "the **morpheus** project is cool" }),
+    });
+    expect(isReplyToOurSignature(msg, identity)).toBe(false);
+  });
+
+  test("ignores signature inside an inline code span in parent", () => {
+    // A message discussing the signature format should NOT trigger reply-routing
+    const msg = makeMsg({
+      content: "got it",
+      referenced_message: makeMsg({
+        content: "the format is `— **morpheus** 💊` — see the docs",
+      }),
+    });
+    expect(isReplyToOurSignature(msg, identity)).toBe(false);
+  });
+
+  test("ignores signature inside a fenced code block in parent", () => {
+    const msg = makeMsg({
+      content: "got it",
+      referenced_message: makeMsg({
+        content: "example signature:\n```\n— **morpheus** 💊 (team)\n```\nuse it everywhere",
+      }),
+    });
+    expect(isReplyToOurSignature(msg, identity)).toBe(false);
+  });
+
+  test("still matches signature outside code spans even if a code span exists", () => {
+    // Real signature is outside the code block; the code block contains other content
+    const msg = makeMsg({
+      content: "thanks",
+      referenced_message: makeMsg({
+        content: "fix is at `index.ts:520` — **morpheus** 💊 (team)",
+      }),
+    });
+    expect(isReplyToOurSignature(msg, identity)).toBe(true);
   });
 });
 
