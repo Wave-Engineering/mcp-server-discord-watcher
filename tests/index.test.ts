@@ -15,6 +15,9 @@ import {
   loadConfig,
   checkKillSwitch,
   engageKillSwitch,
+  checkAuthFailed,
+  engageAuthFailed,
+  clearAuthFailed,
   checkScreamHoleHealth,
   resolveApiBase,
   shouldDeliverMessage,
@@ -878,6 +881,148 @@ describe("kill switch", () => {
     const content = read(KILL_FILE, "utf-8").trim();
     // Must be a plain integer (Unix timestamp) — discord-bot checks with regex ^[0-9]+$
     expect(content).toMatch(/^\d+$/);
+  });
+});
+
+// --- Auth-failure circuit breaker tests --------------------------------------
+//
+// Regression suite for issue #8. The watcher previously caught 401 responses
+// in the per-channel error handler, logged them, and continued polling
+// forever — silently delivering zero notifications. The fix adds a sentinel-
+// file-backed circuit breaker (mirroring the kill switch pattern) that
+// engages on first 401, short-circuits subsequent polls, emits a one-time
+// MCP notification to the Claude session, and is cleared on watcher restart.
+
+describe("auth-failure circuit breaker", () => {
+  const AUTH_FAILED_FILE = `${process.env.HOME}/.claude/discord-bot.auth-failed`;
+
+  afterEach(async () => {
+    // Clean up sentinel file after each test
+    const { unlinkSync: unlink } = await import("node:fs");
+    try { unlink(AUTH_FAILED_FILE); } catch { /* ignore if not exists */ }
+  });
+
+  test("checkAuthFailed returns false when sentinel file does not exist", () => {
+    // Ensure file doesn't exist
+    const { unlinkSync: unlink } = require("node:fs");
+    try { unlink(AUTH_FAILED_FILE); } catch { /* ignore */ }
+
+    expect(checkAuthFailed()).toBe(false);
+  });
+
+  test("engageAuthFailed creates the sentinel file with an ISO timestamp", async () => {
+    const { existsSync, readFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(`${process.env.HOME}/.claude`, { recursive: true });
+
+    engageAuthFailed();
+
+    expect(existsSync(AUTH_FAILED_FILE)).toBe(true);
+    const content = readFileSync(AUTH_FAILED_FILE, "utf-8");
+    // ISO timestamp prefix + the canonical reason string
+    expect(content).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+    expect(content).toContain("401 Unauthorized");
+  });
+
+  test("engageAuthFailed is idempotent — second call does not overwrite", async () => {
+    const { existsSync, readFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(`${process.env.HOME}/.claude`, { recursive: true });
+
+    engageAuthFailed();
+    expect(existsSync(AUTH_FAILED_FILE)).toBe(true);
+    const firstContent = readFileSync(AUTH_FAILED_FILE, "utf-8");
+
+    // Wait a tick to ensure any second-write would have a different timestamp
+    await new Promise((r) => setTimeout(r, 10));
+
+    engageAuthFailed();
+    const secondContent = readFileSync(AUTH_FAILED_FILE, "utf-8");
+
+    expect(secondContent).toBe(firstContent);
+  });
+
+  test("checkAuthFailed returns true after engageAuthFailed", async () => {
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(`${process.env.HOME}/.claude`, { recursive: true });
+
+    expect(checkAuthFailed()).toBe(false);
+    engageAuthFailed();
+    expect(checkAuthFailed()).toBe(true);
+  });
+
+  test("clearAuthFailed removes the sentinel file", async () => {
+    const { existsSync, mkdirSync } = await import("node:fs");
+    mkdirSync(`${process.env.HOME}/.claude`, { recursive: true });
+
+    engageAuthFailed();
+    expect(existsSync(AUTH_FAILED_FILE)).toBe(true);
+
+    clearAuthFailed();
+    expect(existsSync(AUTH_FAILED_FILE)).toBe(false);
+    expect(checkAuthFailed()).toBe(false);
+  });
+
+  test("clearAuthFailed is idempotent when sentinel does not exist", () => {
+    // No file, no error
+    expect(() => clearAuthFailed()).not.toThrow();
+    expect(checkAuthFailed()).toBe(false);
+  });
+});
+
+describe("refreshChannelList: auth-failure integration", () => {
+  let originalFetch: typeof globalThis.fetch;
+  const AUTH_FAILED_FILE = `${process.env.HOME}/.claude/discord-bot.auth-failed`;
+  const KILL_FILE = `${process.env.HOME}/.claude/discord-bot.kill`;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(async () => {
+    globalThis.fetch = originalFetch;
+    const { unlinkSync } = await import("node:fs");
+    try { unlinkSync(AUTH_FAILED_FILE); } catch { /* ignore */ }
+    try { unlinkSync(KILL_FILE); } catch { /* ignore */ }
+  });
+
+  test("returns early without fetch when auth-failed sentinel exists", async () => {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(`${process.env.HOME}/.claude`, { recursive: true });
+    writeFileSync(AUTH_FAILED_FILE, new Date().toISOString());
+
+    let fetchCallCount = 0;
+    globalThis.fetch = mock(async () => {
+      fetchCallCount++;
+      return new Response("[]", { status: 200 });
+    }) as any;
+
+    await refreshChannelList("Bot fake-token");
+
+    expect(fetchCallCount).toBe(0);
+  });
+
+  test("engages auth-failed when fetchTextChannels returns 401", async () => {
+    // Ensure clean state
+    const { unlinkSync } = await import("node:fs");
+    try { unlinkSync(AUTH_FAILED_FILE); } catch { /* ignore */ }
+
+    expect(checkAuthFailed()).toBe(false);
+
+    globalThis.fetch = mock(async () => {
+      return new Response("Unauthorized", { status: 401 });
+    }) as any;
+
+    // refreshChannelList swallows fetchTextChannels errors via the outer
+    // catch in the setInterval wrapper, but inside the function the throw
+    // propagates. We catch it here so the test continues to the assertion.
+    try {
+      await refreshChannelList("Bot fake-token");
+    } catch {
+      // Expected — fetchTextChannels throws on non-OK
+    }
+
+    // The 401 should have been intercepted by apiGet → engageAuthFailed,
+    // regardless of whether the throw bubbled up
+    expect(checkAuthFailed()).toBe(true);
   });
 });
 

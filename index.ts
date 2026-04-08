@@ -173,6 +173,66 @@ export function engageKillSwitch(retryAfterSeconds: number): void {
   }
 }
 
+// --- Auth-failure circuit breaker --------------------------------------------
+//
+// Distinct from the kill switch (which handles transient 429s with auto-lift):
+// auth failure is a *permanent* state for the current bot token. Once Discord
+// returns 401 the token is expired/revoked and no amount of retrying will fix
+// it — only operator intervention (new token + watcher restart) recovers.
+//
+// State lives in a sentinel file at ~/.claude/discord-bot.auth-failed. The
+// file is cleared at watcher startup (clearAuthFailed in main()) so a fresh
+// process with a fresh token retries cleanly.
+
+const AUTH_FAILED_FILE = join(homedir(), ".claude", "discord-bot.auth-failed");
+
+/**
+ * Returns true if the auth-failed sentinel file exists. The watcher uses
+ * this to short-circuit polling and channel-refresh cycles when the bot
+ * token is known to be bad.
+ */
+export function checkAuthFailed(): boolean {
+  return existsSync(AUTH_FAILED_FILE);
+}
+
+/**
+ * Engage the auth-failure circuit breaker. Called from `apiGet` when Discord
+ * returns 401 Unauthorized. Idempotent — only logs and writes the sentinel
+ * file once per process so repeated 401s during a single poll cycle don't
+ * spam stderr.
+ */
+export function engageAuthFailed(): void {
+  if (existsSync(AUTH_FAILED_FILE)) return;
+  try {
+    writeFileSync(
+      AUTH_FAILED_FILE,
+      `${new Date().toISOString()} Discord 401 Unauthorized\n`
+    );
+    console.error(
+      "[discord-watcher] AUTH FAILURE: Discord returned 401 Unauthorized. " +
+      "Bot token is expired or revoked. Polling suspended until you update " +
+      "the token and restart the watcher."
+    );
+  } catch (err) {
+    console.error(
+      `[discord-watcher] Failed to write auth-failed sentinel: ${err}`
+    );
+  }
+}
+
+/**
+ * Clear the auth-failed sentinel file. Called from `main()` at watcher
+ * startup so a fresh process with a fresh token retries cleanly. Idempotent —
+ * silently does nothing if the file does not exist.
+ */
+export function clearAuthFailed(): void {
+  try {
+    unlinkSync(AUTH_FAILED_FILE);
+  } catch {
+    // File doesn't exist — nothing to clear
+  }
+}
+
 // --- Scream-hole health check ------------------------------------------------
 
 /**
@@ -275,6 +335,14 @@ async function apiGet(
     const retryAfter = parseFloat(res.headers.get("Retry-After") ?? "5");
     engageKillSwitch(retryAfter);
     return { ok: false, status: 429, retryAfter };
+  }
+  if (res.status === 401) {
+    // Bot token is expired or revoked. Engage the auth-failure circuit
+    // breaker so subsequent poll cycles short-circuit instead of spamming
+    // 401s every 15 seconds. Recovery requires operator intervention
+    // (new token + watcher restart).
+    engageAuthFailed();
+    return { ok: false, status: 401 };
   }
   if (!res.ok) {
     return { ok: false, status: res.status };
@@ -577,6 +645,15 @@ async function fetchAllNewMessages(
         await new Promise((r) => setTimeout(r, result.retryAfter! * 1000));
         continue;
       }
+      if (result.status === 401) {
+        // Auth failure already engaged by apiGet via engageAuthFailed().
+        // Return what we've collected so far (typically empty) and let
+        // the caller's checkAuthFailed() guard handle the cleanup. Throwing
+        // here would cause checkForNewMessages's per-channel catch to log
+        // a misleading "Error polling #<channel>" line that looks like a
+        // crash, immediately after the "AUTH FAILURE" line we want.
+        return allMessages;
+      }
       throw new Error(`Discord API HTTP ${result.status}`);
     }
 
@@ -596,25 +673,27 @@ async function fetchAllNewMessages(
 }
 
 /**
- * Refresh the watched channel list. Honors the kill switch — when the
- * watcher is in cooldown after a 429, this is a no-op so the refresh
- * timer doesn't independently re-burst the API while the main poll loop
- * is paused.
+ * Refresh the watched channel list. Honors both circuit breakers — when the
+ * watcher is in 429 cooldown OR has hit a permanent 401 auth failure, this
+ * is a no-op so the refresh timer doesn't independently re-burst the API
+ * while the main poll loop is paused.
  *
  * Mutates module-level `watchedChannels` and `lastSeenMessageId` on
- * successful refresh. Exported so the kill-switch short-circuit can be
+ * successful refresh. Exported so the circuit-breaker short-circuits can be
  * exercised in unit tests.
  */
 export async function refreshChannelList(authHeader: string): Promise<void> {
   if (checkKillSwitch() === "active") return;
+  if (checkAuthFailed()) return;
 
   const fresh = await fetchTextChannels(authHeader);
   for (const ch of fresh) {
-    // Re-check kill switch between baseline calls — if a baseline
-    // request inside this loop trips a 429 and engages the kill switch,
-    // we should stop firing more requests in the same refresh cycle
-    // rather than continue bursting through every newly discovered channel.
+    // Re-check both circuit breakers between baseline calls — if a baseline
+    // request inside this loop trips a 429 OR a 401, we should stop firing
+    // more requests in the same refresh cycle rather than continue bursting
+    // through every newly discovered channel.
     if (checkKillSwitch() === "active") break;
+    if (checkAuthFailed()) break;
 
     if (!lastSeenMessageId.has(ch.id)) {
       try {
@@ -634,12 +713,59 @@ export async function refreshChannelList(authHeader: string): Promise<void> {
   console.error(`[discord-watcher] Refreshed: ${fresh.length} channels`);
 }
 
+// One-time MCP notification flag for auth failure. The notification is sent
+// once per process so a Claude session is alerted exactly once that the
+// watcher has stopped delivering messages due to a bad token. Reset on
+// process restart (module re-import) — paired with clearAuthFailed() in main().
+let authFailureNotificationSent = false;
+
+/**
+ * Emit a one-time MCP notification informing the Claude session that the
+ * watcher has hit an auth failure and polling is suspended. Idempotent —
+ * subsequent calls in the same process are no-ops.
+ */
+async function emitAuthFailedNotificationIfNeeded(server: Server): Promise<void> {
+  if (authFailureNotificationSent) return;
+  authFailureNotificationSent = true;
+  try {
+    await server.notification({
+      method: "notifications/claude/channel" as any,
+      params: {
+        content:
+          "[discord-watcher] AUTH FAILURE: Discord returned 401 Unauthorized. " +
+          "The bot token is expired or revoked. Notification polling is " +
+          "suspended until the operator updates ~/secrets/discord-bot-token " +
+          "(or DISCORD_BOT_TOKEN env var) and restarts the watcher.",
+        meta: {
+          channel_name: "system",
+          channel_id: "auth-failure",
+          author: "discord-watcher",
+          message_id: `auth-failure-${Date.now()}`,
+        },
+      },
+    });
+  } catch (err) {
+    console.error(
+      `[discord-watcher] Failed to emit auth-failed notification: ${err}`
+    );
+  }
+}
+
 async function checkForNewMessages(
   server: Server,
   authHeader: string
 ): Promise<void> {
   // Check kill switch before polling
   if (checkKillSwitch() === "active") return;
+
+  // Check auth-failure circuit breaker. If the bot token has been revoked
+  // or expired, polling is permanently suspended for this process. Emit a
+  // one-time MCP notification so the Claude session knows why notifications
+  // have stopped, then short-circuit every subsequent cycle silently.
+  if (checkAuthFailed()) {
+    await emitAuthFailedNotificationIfNeeded(server);
+    return;
+  }
 
   // Refresh identity each cycle (agent may pick name after server starts)
   cachedIdentity = resolveIdentity();
@@ -723,6 +849,16 @@ async function checkForNewMessages(
         `[discord-watcher] Error polling #${channel.name}: ${err}`
       );
     }
+
+    // If a 401 was caught mid-cycle (apiGet engaged the auth-failure
+    // circuit breaker), break out of the channel loop immediately rather
+    // than continue firing 401s for every remaining channel. Emit the
+    // one-time MCP notification on the way out so the Claude session is
+    // alerted within this cycle, not the next one.
+    if (checkAuthFailed()) {
+      await emitAuthFailedNotificationIfNeeded(server);
+      break;
+    }
   }
 
 }
@@ -739,6 +875,12 @@ const INSTRUCTIONS = [
 ].join("\n");
 
 async function main(): Promise<void> {
+  // Clear any stale auth-failed sentinel from a previous process. This is
+  // the recovery handshake: an operator who has updated the bot token and
+  // restarted the watcher gets a clean retry. If the new token is also
+  // bad, the first apiGet 401 will re-engage the circuit breaker.
+  clearAuthFailed();
+
   // Load token early — fail fast before MCP transport setup
   const token = loadToken();
   const authHeader = `Bot ${token}`;
