@@ -6,6 +6,7 @@
       "name": "mcp-server-discord-watcher",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.12.1",
+        "@wave-engineering/mcp-logger": "^1.0.0",
       },
       "devDependencies": {
         "@types/bun": "latest",
@@ -20,6 +21,8 @@
     "@types/bun": ["@types/bun@1.3.11", "", { "dependencies": { "bun-types": "1.3.11" } }, "sha512-5vPne5QvtpjGpsGYXiFyycfpDF2ECyPcTSsFBMa0fraoxiQyMJ3SmuQIGhzPg2WJuWxVBoxWJ2kClYTcw/4fAg=="],
 
     "@types/node": ["@types/node@25.5.0", "", { "dependencies": { "undici-types": "~7.18.0" } }, "sha512-jp2P3tQMSxWugkCUKLRPVUpGaL5MVFwF8RDuSRztfwgN1wmqJeMSbKlnEtQqU8UrhTmzEmZdu2I6v2dpp7XIxw=="],
+
+    "@wave-engineering/mcp-logger": ["@wave-engineering/mcp-logger@1.0.0", "https://npm.pkg.github.com/download/@wave-engineering/mcp-logger/1.0.0/5143e7b42037d25d7067fd469b153f67bf8a5828", {}, "sha512-YBF9RAKCVGTGfbrh9gOVa0ZxkP5xO7oH+QtNwu6usiFPizIuATwrqXjSfir6gQzr5IbQjzYa6hxax1N1eCW0Rg=="],
 
     "accepts": ["accepts@2.0.0", "", { "dependencies": { "mime-types": "^3.0.0", "negotiator": "^1.0.0" } }, "sha512-5cvg6CtKwfgdmVqY1WIiXKc3Q1bkRqGLi+2W/6ao+6Y7gu/RCwRuAhGEzh5B4KlszSuTLgZYuqFqo5bImjNKng=="],
 

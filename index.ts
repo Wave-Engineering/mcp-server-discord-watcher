@@ -18,6 +18,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createLogger } from "@wave-engineering/mcp-logger";
 
 // --- Build-date query (early exit) ------------------------------------------
 
@@ -64,7 +65,7 @@ export function loadConfig(): { guildId: string; tokenPath: string; screamHoleUr
     try {
       config = JSON.parse(readFileSync(configPath, "utf-8"));
     } catch {
-      console.error(`[discord-watcher] Warning: ${configPath} contains invalid JSON, falling back to defaults`);
+      log.warn("state_change", { what: "config", to: "defaults", reason: "invalid JSON in discord.json" });
     }
   }
 
@@ -88,6 +89,8 @@ export function loadConfig(): { guildId: string; tokenPath: string; screamHoleUr
 
   return { guildId, tokenPath, screamHoleUrl };
 }
+
+const log = createLogger("watcher");
 
 const { guildId: GUILD_ID, tokenPath: CONFIGURED_TOKEN_PATH, screamHoleUrl: CONFIGURED_SCREAM_HOLE_URL } = loadConfig();
 
@@ -127,7 +130,7 @@ export function checkKillSwitch(): "active" | "clear" {
 
   if (!content || !/^\d+$/.test(content)) {
     // Manual kill — no expiry
-    console.error("[discord-watcher] Kill switch active (manual). Skipping poll cycle.");
+    log.warn("state_change", { what: "kill_switch", to: "active", reason: "manual" });
     return "active";
   }
 
@@ -138,7 +141,7 @@ export function checkKillSwitch(): "active" | "clear" {
     // Ban expired — auto-lift
     try {
       unlinkSync(KILL_FILE);
-      console.error("[discord-watcher] Kill switch expired, auto-lifted.");
+      log.info("state_change", { what: "kill_switch", to: "clear", reason: "expired" });
     } catch {
       // File may have been removed by another process
     }
@@ -146,9 +149,7 @@ export function checkKillSwitch(): "active" | "clear" {
   }
 
   const remaining = expiryTimestamp - nowSeconds;
-  console.error(
-    `[discord-watcher] Kill switch active (expires in ~${remaining}s). Skipping poll cycle.`
-  );
+  log.warn("state_change", { what: "kill_switch", to: "active", reason: "timed", remaining_s: remaining });
   return "active";
 }
 
@@ -163,11 +164,9 @@ export function engageKillSwitch(retryAfterSeconds: number): void {
   try {
     writeFileSync(tmpFile, `${expiry}\n`);
     renameSync(tmpFile, KILL_FILE);
-    console.error(
-      `[discord-watcher] 429 received. Kill switch engaged for ~${Math.ceil(retryAfterSeconds)}s.`
-    );
+    log.warn("state_change", { what: "kill_switch", to: "engaged", reason: "429", duration_s: Math.ceil(retryAfterSeconds) });
   } catch (err) {
-    console.error(`[discord-watcher] Failed to write kill switch: ${err}`);
+    log.error("state_change", { what: "kill_switch", to: "write_failed" }, String(err));
     // Clean up temp file if rename failed
     try { unlinkSync(tmpFile); } catch { /* ignore */ }
   }
@@ -208,15 +207,9 @@ export function engageAuthFailed(): void {
       AUTH_FAILED_FILE,
       `${new Date().toISOString()} Discord 401 Unauthorized\n`
     );
-    console.error(
-      "[discord-watcher] AUTH FAILURE: Discord returned 401 Unauthorized. " +
-      "Bot token is expired or revoked. Polling suspended until you update " +
-      "the token and restart the watcher."
-    );
+    log.error("state_change", { what: "auth", to: "failed", reason: "401 Unauthorized" });
   } catch (err) {
-    console.error(
-      `[discord-watcher] Failed to write auth-failed sentinel: ${err}`
-    );
+    log.error("state_change", { what: "auth", to: "sentinel_write_failed" }, String(err));
   }
 }
 
@@ -255,20 +248,18 @@ export async function checkScreamHoleHealth(url: string): Promise<boolean> {
  */
 export async function resolveApiBase(screamHoleUrl: string | null): Promise<string> {
   if (!screamHoleUrl) {
-    console.error("[discord-watcher] Mode: direct Discord API");
+    log.info("state_change", { what: "mode", to: "direct" });
     return DISCORD_API_BASE;
   }
 
   const healthy = await checkScreamHoleHealth(screamHoleUrl);
   if (healthy) {
     const baseUrl = screamHoleUrl.replace(/\/+$/, "");
-    console.error(`[discord-watcher] Mode: scream-hole proxy (${baseUrl})`);
+    log.info("state_change", { what: "mode", to: "scream-hole", url: baseUrl });
     return baseUrl;
   }
 
-  console.error(
-    `[discord-watcher] Warning: scream-hole at ${screamHoleUrl} is unreachable, falling back to direct Discord API`
-  );
+  log.warn("state_change", { what: "mode", from: "scream-hole", to: "direct", reason: "scream-hole unreachable" });
   return DISCORD_API_BASE;
 }
 
@@ -328,11 +319,17 @@ async function apiGet(
   endpoint: string,
   authHeader: string
 ): Promise<{ ok: true; data: unknown } | { ok: false; status: number; retryAfter?: number }> {
+  const service = API_BASE === DISCORD_API_BASE ? "discord" : "scream-hole";
+  // Strip query params for logging (path only)
+  const pathOnly = endpoint.split("?")[0];
+  const t0 = performance.now();
   const res = await fetch(`${API_BASE}${endpoint}`, {
     headers: { Authorization: authHeader },
   });
+  const ms = Math.round(performance.now() - t0);
   if (res.status === 429) {
     const retryAfter = parseFloat(res.headers.get("Retry-After") ?? "5");
+    log.warn("api_call", { method: "GET", endpoint: pathOnly, status: 429, ms, service });
     engageKillSwitch(retryAfter);
     return { ok: false, status: 429, retryAfter };
   }
@@ -341,12 +338,15 @@ async function apiGet(
     // breaker so subsequent poll cycles short-circuit instead of spamming
     // 401s every 15 seconds. Recovery requires operator intervention
     // (new token + watcher restart).
+    log.error("api_call", { method: "GET", endpoint: pathOnly, status: 401, ms, service });
     engageAuthFailed();
     return { ok: false, status: 401 };
   }
   if (!res.ok) {
+    log.warn("api_call", { method: "GET", endpoint: pathOnly, status: res.status, ms, service });
     return { ok: false, status: res.status };
   }
+  log.info("api_call", { method: "GET", endpoint: pathOnly, status: res.status, ms, service });
   return { ok: true, data: await res.json() };
 }
 
@@ -504,7 +504,7 @@ export async function transcribeAudioAttachments(
       // Download audio
       const audioResp = await fetch(attachment.url);
       if (!audioResp.ok) {
-        console.error(`[discord-watcher] Failed to download audio: HTTP ${audioResp.status}`);
+        log.warn("api_call", { method: "GET", endpoint: "audio_attachment", status: audioResp.status, service: "discord" });
         transcriptions.push(`[voice memo attached — download failed]`);
         continue;
       }
@@ -521,7 +521,7 @@ export async function transcribeAudioAttachments(
       });
 
       if (!sttResp.ok) {
-        console.error(`[discord-watcher] STT failed: HTTP ${sttResp.status}`);
+        log.warn("api_call", { method: "POST", endpoint: "/v1/audio/transcriptions", status: sttResp.status, service: "stt" });
         transcriptions.push(`[voice memo attached — transcription failed]`);
         continue;
       }
@@ -531,7 +531,7 @@ export async function transcribeAudioAttachments(
         transcriptions.push(`[voice memo from ${msg.author.username}: "${result.text.trim()}"]`);
       }
     } catch (err) {
-      console.error(`[discord-watcher] STT error: ${err}`);
+      log.error("api_call", { method: "POST", endpoint: "/v1/audio/transcriptions", service: "stt" }, String(err));
       transcriptions.push(`[voice memo attached — transcription failed]`);
     }
   }
@@ -639,9 +639,7 @@ async function fetchAllNewMessages(
 
     if (!result.ok) {
       if (result.status === 429 && result.retryAfter) {
-        console.error(
-          `[discord-watcher] Rate limited, waiting ${result.retryAfter}s`
-        );
+        log.warn("api_call", { method: "GET", endpoint: `/channels/${channelId}/messages`, status: 429, retry_after_s: result.retryAfter, service: API_BASE === DISCORD_API_BASE ? "discord" : "scream-hole" });
         await new Promise((r) => setTimeout(r, result.retryAfter! * 1000));
         continue;
       }
@@ -710,7 +708,7 @@ export async function refreshChannelList(authHeader: string): Promise<void> {
     }
   }
   watchedChannels = fresh;
-  console.error(`[discord-watcher] Refreshed: ${fresh.length} channels`);
+  log.info("state_change", { what: "channels", to: "refreshed", channels: fresh.length });
 }
 
 // One-time MCP notification flag for auth failure. The notification is sent
@@ -745,9 +743,7 @@ async function emitAuthFailedNotificationIfNeeded(server: Server): Promise<void>
       },
     });
   } catch (err) {
-    console.error(
-      `[discord-watcher] Failed to emit auth-failed notification: ${err}`
-    );
+    log.error("state_change", { what: "auth", to: "notification_failed" }, String(err));
   }
 }
 
@@ -769,6 +765,12 @@ async function checkForNewMessages(
 
   // Refresh identity each cycle (agent may pick name after server starts)
   cachedIdentity = resolveIdentity();
+
+  const cycleVia = API_BASE === DISCORD_API_BASE ? "direct" : "scream-hole";
+  log.debug("poll", { via: cycleVia, api_base: API_BASE });
+
+  const cycleT0 = performance.now();
+  let cycleNewMessages = 0;
 
   let isFirstChannel = true;
   for (const channel of watchedChannels) {
@@ -797,9 +799,7 @@ async function checkForNewMessages(
             lastSeenMessageId.set(channel.id, msgs[0].id);
           }
         } else if (result.status === 429 && result.retryAfter) {
-          console.error(
-            `[discord-watcher] Rate limited on #${channel.name}, skipping cycle`
-          );
+          log.warn("api_call", { method: "GET", endpoint: `/channels/${channel.id}/messages`, status: 429, service: cycleVia, channel: channel.name });
         }
         continue;
       }
@@ -816,6 +816,8 @@ async function checkForNewMessages(
           continue;
         }
 
+        cycleNewMessages++;
+
         // Transcribe audio attachments if present
         const audioTranscription = await transcribeAudioAttachments(msg, authHeader);
         const fullContent = audioTranscription
@@ -827,9 +829,7 @@ async function checkForNewMessages(
             ? fullContent.slice(0, 100) + "…"
             : fullContent;
 
-        console.error(
-          `[discord-watcher] New message in #${channel.name} from ${msg.author.username}: ${preview}`
-        );
+        log.debug("poll", { channel: channel.name, author: msg.author.username });
 
         await server.notification({
           method: "notifications/claude/channel" as any,
@@ -845,9 +845,7 @@ async function checkForNewMessages(
         });
       }
     } catch (err) {
-      console.error(
-        `[discord-watcher] Error polling #${channel.name}: ${err}`
-      );
+      log.error("poll", { channel: channel.name }, String(err));
     }
 
     // If a 401 was caught mid-cycle (apiGet engaged the auth-failure
@@ -861,6 +859,8 @@ async function checkForNewMessages(
     }
   }
 
+  const cycleMs = Math.round(performance.now() - cycleT0);
+  log.info("poll", { channels: watchedChannels.length, new_messages: cycleNewMessages, ms: cycleMs, via: cycleVia });
 }
 
 // --- Main --------------------------------------------------------------------
@@ -906,16 +906,21 @@ async function main(): Promise<void> {
     watchedChannels = await fetchTextChannels(authHeader);
     await initializeBaselines(authHeader);
   } catch (err) {
-    console.error(`[discord-watcher] Initialization failed: ${err}`);
-    console.error(
-      "[discord-watcher] Cannot watch channels without channel list. Exiting."
-    );
+    log.error("startup", {}, `Initialization failed: ${err}`);
     process.exit(1);
   }
 
-  console.error(
-    `[discord-watcher] Watching ${watchedChannels.length} channels: ${watchedChannels.map((c) => `#${c.name}`).join(", ")}`
-  );
+  log.info("startup", {
+    version: "0.1.0",
+    config: {
+      guild_id: GUILD_ID,
+      channels: watchedChannels.length,
+      api_base: API_BASE,
+      mode: API_BASE === DISCORD_API_BASE ? "direct" : "scream-hole",
+      poll_interval_ms: POLL_INTERVAL_MS,
+      verbose: VERBOSE,
+    },
+  });
 
   // Poll for new messages
   const pollTimer = setInterval(
@@ -927,7 +932,7 @@ async function main(): Promise<void> {
   // refreshChannelList — see its docstring)
   const refreshTimer = setInterval(() => {
     refreshChannelList(authHeader).catch((err) => {
-      console.error(`[discord-watcher] Channel refresh failed: ${err}`);
+      log.error("state_change", { what: "channels", to: "refresh_failed" }, String(err));
     });
   }, CHANNEL_REFRESH_MS);
 
@@ -948,7 +953,7 @@ async function main(): Promise<void> {
 // Only run when executed directly (not when imported by tests)
 if (import.meta.main) {
   main().catch((err) => {
-    console.error(`[discord-watcher] Fatal: ${err}`);
+    log.error("startup", {}, `Fatal: ${err}`);
     process.exit(1);
   });
 }
