@@ -229,22 +229,57 @@ export function clearAuthFailed(): void {
 // --- Scream-hole health check ------------------------------------------------
 
 /**
+ * Extract the origin (scheme + host + port) from a URL string, stripping any
+ * path components. Used to hit the health endpoint at the root of the
+ * scream-hole proxy regardless of whether the config URL includes `/api/v10`.
+ */
+export function extractOrigin(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return parsed.origin;
+  } catch {
+    // If URL parsing fails, strip trailing slashes and path as best we can
+    return url.replace(/\/+$/, "").replace(/\/api\/v10\/?$/, "");
+  }
+}
+
+/**
  * Check if scream-hole is reachable by hitting its /health endpoint.
+ * Always hits the origin root (e.g. https://host/health), regardless of
+ * whether the configured URL includes /api/v10.
  * Returns true if reachable, false otherwise.
  */
 export async function checkScreamHoleHealth(url: string): Promise<boolean> {
+  const origin = extractOrigin(url);
+  const healthUrl = `${origin}/health`;
   try {
-    const healthUrl = `${url.replace(/\/+$/, "")}/health`;
+    log.debug("health_check", { url: healthUrl });
     const res = await fetch(healthUrl, { signal: AbortSignal.timeout(5000) });
+    log.debug("health_check", { url: healthUrl, status: res.status, ok: res.ok });
     return res.ok;
-  } catch {
+  } catch (err) {
+    log.debug("health_check", { url: healthUrl, error: String(err) });
     return false;
   }
 }
 
 /**
+ * Ensure a scream-hole URL ends with `/api/v10` (the Discord-compatible API
+ * prefix). Handles both forms:
+ *   - Origin only: `https://host` → `https://host/api/v10`
+ *   - Already suffixed: `https://host/api/v10/` → `https://host/api/v10`
+ */
+export function ensureApiV10Suffix(url: string): string {
+  const stripped = url.replace(/\/+$/, "");
+  if (/\/api\/v10$/.test(stripped)) {
+    return stripped;
+  }
+  return `${stripped}/api/v10`;
+}
+
+/**
  * Resolve which API base URL to use. If scream-hole is configured and reachable,
- * use it; otherwise fall back to direct Discord API.
+ * use it (with /api/v10 suffix); otherwise fall back to direct Discord API.
  */
 export async function resolveApiBase(screamHoleUrl: string | null): Promise<string> {
   if (!screamHoleUrl) {
@@ -254,7 +289,7 @@ export async function resolveApiBase(screamHoleUrl: string | null): Promise<stri
 
   const healthy = await checkScreamHoleHealth(screamHoleUrl);
   if (healthy) {
-    const baseUrl = screamHoleUrl.replace(/\/+$/, "");
+    const baseUrl = ensureApiV10Suffix(screamHoleUrl);
     log.info("state_change", { what: "mode", to: "scream-hole", url: baseUrl });
     return baseUrl;
   }

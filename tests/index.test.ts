@@ -18,7 +18,9 @@ import {
   checkAuthFailed,
   engageAuthFailed,
   clearAuthFailed,
+  extractOrigin,
   checkScreamHoleHealth,
+  ensureApiV10Suffix,
   resolveApiBase,
   shouldDeliverMessage,
   isReplyToOurSignature,
@@ -1144,6 +1146,74 @@ describe("loadConfig", () => {
   });
 });
 
+// --- extractOrigin tests -----------------------------------------------------
+
+describe("extractOrigin", () => {
+  test("extracts origin from bare URL", () => {
+    expect(extractOrigin("https://scream-hole.apps.oakai.waveeng.com")).toBe(
+      "https://scream-hole.apps.oakai.waveeng.com"
+    );
+  });
+
+  test("extracts origin from URL with /api/v10 path", () => {
+    expect(extractOrigin("https://scream-hole.apps.oakai.waveeng.com/api/v10")).toBe(
+      "https://scream-hole.apps.oakai.waveeng.com"
+    );
+  });
+
+  test("extracts origin from URL with /api/v10/ trailing slash", () => {
+    expect(extractOrigin("https://scream-hole.apps.oakai.waveeng.com/api/v10/")).toBe(
+      "https://scream-hole.apps.oakai.waveeng.com"
+    );
+  });
+
+  test("extracts origin from URL with port", () => {
+    expect(extractOrigin("http://scream-hole:3000/api/v10")).toBe(
+      "http://scream-hole:3000"
+    );
+  });
+
+  test("extracts origin from bare URL with trailing slash", () => {
+    expect(extractOrigin("http://scream-hole:3000/")).toBe(
+      "http://scream-hole:3000"
+    );
+  });
+});
+
+// --- ensureApiV10Suffix tests ------------------------------------------------
+
+describe("ensureApiV10Suffix", () => {
+  test("appends /api/v10 to bare origin", () => {
+    expect(ensureApiV10Suffix("https://scream-hole.apps.oakai.waveeng.com")).toBe(
+      "https://scream-hole.apps.oakai.waveeng.com/api/v10"
+    );
+  });
+
+  test("does not double-append when URL already has /api/v10", () => {
+    expect(ensureApiV10Suffix("https://scream-hole.apps.oakai.waveeng.com/api/v10")).toBe(
+      "https://scream-hole.apps.oakai.waveeng.com/api/v10"
+    );
+  });
+
+  test("strips trailing slash and does not double-append", () => {
+    expect(ensureApiV10Suffix("https://scream-hole.apps.oakai.waveeng.com/api/v10/")).toBe(
+      "https://scream-hole.apps.oakai.waveeng.com/api/v10"
+    );
+  });
+
+  test("works with port-based URL", () => {
+    expect(ensureApiV10Suffix("http://scream-hole:3000")).toBe(
+      "http://scream-hole:3000/api/v10"
+    );
+  });
+
+  test("strips trailing slash from bare origin before appending", () => {
+    expect(ensureApiV10Suffix("http://scream-hole:3000/")).toBe(
+      "http://scream-hole:3000/api/v10"
+    );
+  });
+});
+
 // --- Scream-hole health check tests ------------------------------------------
 
 describe("checkScreamHoleHealth", () => {
@@ -1196,6 +1266,33 @@ describe("checkScreamHoleHealth", () => {
     const result = await checkScreamHoleHealth("http://scream-hole:3000/");
     expect(result).toBe(true);
   });
+
+  test("hits origin /health even when URL includes /api/v10 path", async () => {
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      // Must hit the origin root, NOT /api/v10/health
+      expect(url).toBe("https://scream-hole.apps.oakai.waveeng.com/health");
+      return new Response("OK", { status: 200 });
+    }) as any;
+
+    const result = await checkScreamHoleHealth(
+      "https://scream-hole.apps.oakai.waveeng.com/api/v10"
+    );
+    expect(result).toBe(true);
+  });
+
+  test("hits origin /health even when URL includes /api/v10/ trailing slash", async () => {
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      expect(url).toBe("https://scream-hole.apps.oakai.waveeng.com/health");
+      return new Response("OK", { status: 200 });
+    }) as any;
+
+    const result = await checkScreamHoleHealth(
+      "https://scream-hole.apps.oakai.waveeng.com/api/v10/"
+    );
+    expect(result).toBe(true);
+  });
 });
 
 // --- resolveApiBase tests ----------------------------------------------------
@@ -1216,13 +1313,13 @@ describe("resolveApiBase", () => {
     expect(result).toBe(DISCORD_API_BASE);
   });
 
-  test("returns scream-hole URL when health check passes", async () => {
+  test("returns scream-hole URL with /api/v10 when health check passes", async () => {
     globalThis.fetch = mock(async () => {
       return new Response("OK", { status: 200 });
     }) as any;
 
     const result = await resolveApiBase("http://scream-hole:3000");
-    expect(result).toBe("http://scream-hole:3000");
+    expect(result).toBe("http://scream-hole:3000/api/v10");
   });
 
   test("returns Discord API base when scream-hole health check fails", async () => {
@@ -1234,13 +1331,31 @@ describe("resolveApiBase", () => {
     expect(result).toBe(DISCORD_API_BASE);
   });
 
-  test("strips trailing slashes from scream-hole URL", async () => {
+  test("strips trailing slashes and appends /api/v10", async () => {
     globalThis.fetch = mock(async () => {
       return new Response("OK", { status: 200 });
     }) as any;
 
     const result = await resolveApiBase("http://scream-hole:3000/");
-    expect(result).toBe("http://scream-hole:3000");
+    expect(result).toBe("http://scream-hole:3000/api/v10");
+  });
+
+  test("does not double-append /api/v10 when URL already has it", async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response("OK", { status: 200 });
+    }) as any;
+
+    const result = await resolveApiBase("https://scream-hole.apps.oakai.waveeng.com/api/v10");
+    expect(result).toBe("https://scream-hole.apps.oakai.waveeng.com/api/v10");
+  });
+
+  test("handles URL with /api/v10/ trailing slash", async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response("OK", { status: 200 });
+    }) as any;
+
+    const result = await resolveApiBase("https://scream-hole.apps.oakai.waveeng.com/api/v10/");
+    expect(result).toBe("https://scream-hole.apps.oakai.waveeng.com/api/v10");
   });
 
   test("returns Discord API base when scream-hole returns non-200", async () => {
@@ -1287,5 +1402,28 @@ describe("scream-hole source integration", () => {
 
     // fetchAllNewMessages must include after in query
     expect(src).toContain("messages?after=${cursor}&limit=");
+  });
+
+  test("resolveApiBase applies ensureApiV10Suffix (source verification)", () => {
+    const { readFileSync } = require("node:fs");
+    const src = readFileSync(
+      new URL("../index.ts", import.meta.url).pathname,
+      "utf-8"
+    );
+
+    // resolveApiBase must call ensureApiV10Suffix before returning
+    expect(src).toContain("ensureApiV10Suffix(screamHoleUrl)");
+  });
+
+  test("checkScreamHoleHealth uses extractOrigin for health URL (source verification)", () => {
+    const { readFileSync } = require("node:fs");
+    const src = readFileSync(
+      new URL("../index.ts", import.meta.url).pathname,
+      "utf-8"
+    );
+
+    // Health check must extract origin to avoid hitting /api/v10/health
+    expect(src).toContain("extractOrigin(url)");
+    expect(src).toContain("${origin}/health");
   });
 });
