@@ -607,6 +607,22 @@ function recentMessageUrl(channelId: string): string {
 let watchedChannels: DiscordChannel[] = [];
 const lastSeenMessageId = new Map<string, string>();
 
+// Deduplication: track recently delivered message IDs so upstream cache bugs
+// (e.g. scream-hole returning already-seen messages) can't cause re-delivery.
+// Bounded to prevent unbounded memory growth — oldest entries evicted via FIFO.
+const DELIVERED_SET_MAX = 500;
+const deliveredMessageIds = new Set<string>();
+const deliveredOrder: string[] = [];
+
+function markDelivered(messageId: string): void {
+  if (deliveredMessageIds.has(messageId)) return;
+  deliveredMessageIds.add(messageId);
+  deliveredOrder.push(messageId);
+  while (deliveredOrder.length > DELIVERED_SET_MAX) {
+    deliveredMessageIds.delete(deliveredOrder.shift()!);
+  }
+}
+
 // --- Channel discovery -------------------------------------------------------
 
 async function fetchTextChannels(authHeader: string): Promise<DiscordChannel[]> {
@@ -628,6 +644,10 @@ async function initializeBaselines(authHeader: string): Promise<void> {
         const messages = result.data as DiscordMessage[];
         if (messages.length > 0) {
           lastSeenMessageId.set(channel.id, messages[0].id);
+          // Mark baseline messages as delivered so they're never re-delivered
+          for (const msg of messages) {
+            markDelivered(msg.id);
+          }
         }
       }
     } catch {
@@ -735,6 +755,9 @@ export async function refreshChannelList(authHeader: string): Promise<void> {
           const msgs = result.data as DiscordMessage[];
           if (msgs.length > 0) {
             lastSeenMessageId.set(ch.id, msgs[0].id);
+            for (const msg of msgs) {
+              markDelivered(msg.id);
+            }
           }
         }
       } catch {
@@ -847,10 +870,17 @@ async function checkForNewMessages(
 
       // Push a wake-up notification for each new message (oldest first)
       for (const msg of messages.reverse()) {
+        // Dedup: skip messages we've already delivered (guards against
+        // upstream cache bugs returning stale messages)
+        if (deliveredMessageIds.has(msg.id)) {
+          continue;
+        }
+
         if (!shouldDeliverMessage(msg, cachedIdentity, { verbose: VERBOSE })) {
           continue;
         }
 
+        markDelivered(msg.id);
         cycleNewMessages++;
 
         // Transcribe audio attachments if present
