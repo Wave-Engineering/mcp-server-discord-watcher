@@ -381,7 +381,7 @@ async function apiGet(
     log.warn("api_call", { method: "GET", endpoint: pathOnly, status: res.status, ms, service });
     return { ok: false, status: res.status };
   }
-  log.info("api_call", { method: "GET", endpoint: pathOnly, status: res.status, ms, service });
+  log.debug("api_call", { method: "GET", endpoint: pathOnly, status: res.status, ms, service });
   return { ok: true, data: await res.json() };
 }
 
@@ -894,7 +894,7 @@ async function checkForNewMessages(
             ? fullContent.slice(0, 100) + "…"
             : fullContent;
 
-        log.debug("poll", { channel: channel.name, author: msg.author.username });
+        log.info("poll", { channel: channel.name, author: msg.author.username });
 
         await server.notification({
           method: "notifications/claude/channel" as any,
