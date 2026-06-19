@@ -16,6 +16,7 @@ import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
+import { sanitizeSurrogates } from "./sanitize.ts";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLogger } from "@wave-engineering/mcp-logger";
@@ -896,14 +897,19 @@ async function checkForNewMessages(
 
         log.info("poll", { channel: channel.name, author: msg.author.username });
 
+        // Sanitize before the content lands in the receiving agent's transcript:
+        // a lone surrogate in a pulled username/preview would 400 its next request.
+        const safeAuthor = sanitizeSurrogates(msg.author.username);
+        const safePreview = sanitizeSurrogates(preview);
+
         await server.notification({
           method: "notifications/claude/channel" as any,
           params: {
-            content: `New message from ${msg.author.username} in #${channel.name}: ${preview}`,
+            content: `New message from ${safeAuthor} in #${channel.name}: ${safePreview}`,
             meta: {
               channel_name: channel.name,
               channel_id: channel.id,
-              author: msg.author.username,
+              author: safeAuthor,
               message_id: msg.id,
             },
           },
