@@ -61,6 +61,14 @@ an MCP notification to the Claude Code session.
 - **Targeted routing** -- Only messages addressed to `@all`, `@<dev-team>`, or
   `@<dev-name>` are delivered. Set `DISCORD_WATCHER_VERBOSE=1` to bypass
   filtering and receive all messages.
+- **Channel scoping (deliver-layer)** -- The watcher always polls every text
+  channel in the guild (required so channel injection works), but only
+  *delivers* wake-ups from channels in its **allowlist**. Set the allowlist via
+  `watcher_channels` in `discord.json`, or `DISCORD_WATCHER_CHANNELS`, to scope
+  an agent to its own channels by id or name. Out-of-scope channels are polled
+  but never delivered, so their traffic can't wake the agent even when it
+  mentions the agent's `@<dev-team>` / `@<dev-name>`. Required when multiple
+  teams share one guild -- see [Multi-team scoping](#multi-team-scoping).
 - **Voice memo transcription** -- Audio attachments are automatically transcribed
   via Whisper STT and delivered as `[voice memo from <author>: "<text>"]`.
 
@@ -80,6 +88,7 @@ The watcher reads `~/.claude/discord.json` for guild and token configuration:
 {
   "guild_id": "1486516321385578576",
   "token_path": "~/secrets/discord-bot-token",
+  "watcher_channels": ["oaw", "roll-call", "precheck", "wave-status"],
   "channels": {
     "roll-call": { "name": "roll-call", "id": "1487382005036617851" }
   }
@@ -96,8 +105,34 @@ Fallback chain: config file -> environment variables -> hardcoded defaults.
 | `DISCORD_GUILD_ID` | `1486516321385578576` | Guild to watch |
 | `DISCORD_TOKEN_PATH` | `~/secrets/discord-bot-token` | Path to token file |
 | `DISCORD_WATCHER_VERBOSE` | `0` | Set to `1` to bypass message filtering |
+| `DISCORD_WATCHER_CHANNELS` | (unset → deliver from all) | Comma-separated channel ids/names to scope *delivery* to (all channels are still polled) |
 | `STT_ENDPOINT` | `http://archer:8300/v1/audio/transcriptions` | Whisper STT endpoint |
 | `STT_MODEL` | `deepdml/faster-whisper-large-v3-turbo-ct2` | STT model name |
+
+### Multi-team scoping
+
+When more than one team shares a single Discord guild, the **channel allowlist
+is required** to prevent cross-team wake-ups. Without it, a message in any
+channel that mentions a team's `@<dev-team>` / `@<dev-name>` wakes that team's
+agents -- including messages in another team's channels. Scope each team's
+watcher to its own channels (plus any shared channels) via `watcher_channels`
+or `DISCORD_WATCHER_CHANNELS`. The watcher still polls every channel (so channel
+injection keeps working); the allowlist only gates which channels' messages are
+*delivered* as wake-ups.
+
+Two operational notes:
+
+- **Inert until configured *and restarted*.** Setting the allowlist does not
+  affect an already-running watcher -- the scope is read at startup. Rollout is:
+  set the per-team channel scope, then restart each team's watcher. Verify
+  end-to-end (a real `@<dev-team>` post in an in-scope channel wakes the team; a
+  post in an out-of-scope channel does not) -- config-exists is not
+  config-works.
+- **`@all` is channel-scoped under deliver-scoping.** Because out-of-scope
+  channels are never delivered, `@all` reaches only agents whose allowlist
+  includes the channel the message was posted in. A true cross-team broadcast
+  must be posted in a channel present in *every* team's allowlist (a shared
+  broadcast channel).
 
 ## Uninstall
 
