@@ -49,6 +49,36 @@ export interface DiscordConfig {
   channels?: {
     [role: string]: { name: string; id: string };
   };
+  /** Poll-scope allowlist: channel IDs or names this watcher may watch. */
+  watcher_channels?: string[];
+}
+
+/**
+ * Compute the channel allowlist (deliver-scope) from config + env.
+ * Precedence: discord.json `watcher_channels` (non-empty array) → env
+ * `DISCORD_WATCHER_CHANNELS` (comma-separated channel IDs or names) → null.
+ * `null` means "no allowlist" — deliver from every channel (backward-compatible),
+ * so existing single-team setups are unaffected. Entries may be channel IDs or
+ * names; matching is by either (see isChannelInScope).
+ */
+export function computeChannelAllowlist(
+  config: DiscordConfig,
+  envValue: string | undefined
+): string[] | null {
+  if (Array.isArray(config.watcher_channels)) {
+    const fromConfig = config.watcher_channels
+      .map((c) => String(c).trim())
+      .filter((c) => c.length > 0);
+    if (fromConfig.length > 0) return fromConfig;
+  }
+  if (envValue) {
+    const fromEnv = envValue
+      .split(",")
+      .map((c) => c.trim())
+      .filter((c) => c.length > 0);
+    if (fromEnv.length > 0) return fromEnv;
+  }
+  return null;
 }
 
 /**
@@ -57,7 +87,12 @@ export interface DiscordConfig {
  * 2. Environment variables
  * 3. Hardcoded defaults
  */
-export function loadConfig(): { guildId: string; tokenPath: string; screamHoleUrl: string | null } {
+export function loadConfig(): {
+  guildId: string;
+  tokenPath: string;
+  screamHoleUrl: string | null;
+  channelAllowlist: string[] | null;
+} {
   let config: DiscordConfig = {};
   const configPath = join(homedir(), ".claude", "discord.json");
 
@@ -88,12 +123,31 @@ export function loadConfig(): { guildId: string; tokenPath: string; screamHoleUr
     process.env.SCREAM_HOLE_URL ||
     null;
 
-  return { guildId, tokenPath, screamHoleUrl };
+  // 5. Channel allowlist (deliver-scope): config → env → null (deliver from all).
+  // Warn loudly if watcher_channels is present but not an array — a string like
+  // "oaw,roll-call" is a common mistake that would be silently ignored and
+  // reopen the cross-team leak by falling through to deliver-from-all.
+  if (
+    config.watcher_channels !== undefined &&
+    !Array.isArray(config.watcher_channels)
+  ) {
+    log.warn("state_change", {
+      what: "config",
+      to: "watcher_channels_ignored",
+      reason: "watcher_channels must be an array of channel ids/names",
+    });
+  }
+  const channelAllowlist = computeChannelAllowlist(
+    config,
+    process.env.DISCORD_WATCHER_CHANNELS
+  );
+
+  return { guildId, tokenPath, screamHoleUrl, channelAllowlist };
 }
 
 const log = createLogger("watcher");
 
-const { guildId: GUILD_ID, tokenPath: CONFIGURED_TOKEN_PATH, screamHoleUrl: CONFIGURED_SCREAM_HOLE_URL } = loadConfig();
+const { guildId: GUILD_ID, tokenPath: CONFIGURED_TOKEN_PATH, screamHoleUrl: CONFIGURED_SCREAM_HOLE_URL, channelAllowlist: CHANNEL_ALLOWLIST } = loadConfig();
 
 export const DISCORD_API_BASE = "https://discord.com/api/v10";
 let API_BASE = DISCORD_API_BASE;
@@ -386,7 +440,7 @@ async function apiGet(
   return { ok: true, data: await res.json() };
 }
 
-interface DiscordChannel {
+export interface DiscordChannel {
   id: string;
   name: string;
   type: number;
@@ -626,11 +680,40 @@ function markDelivered(messageId: string): void {
 
 // --- Channel discovery -------------------------------------------------------
 
+/**
+ * Deliver-layer channel scope check. A `null` allowlist ⇒ every channel is in
+ * scope (backward-compatible). Otherwise a channel is in scope iff its id OR
+ * name (case-insensitive) is in the allowlist.
+ *
+ * Scoping lives at the DELIVER layer, not the poll layer: the watcher must keep
+ * polling every channel so `--dangerously-load-development-channels` can inject
+ * (without that, nothing reaches any session). This gate only decides which
+ * channels' messages are delivered as wake-ups, scoping each agent to its own
+ * channels — which is the cross-team leak fix (#31).
+ *
+ * Case-insensitive on names: Discord lowercases text-channel names in its UI,
+ * but the REST API can return mixed case, so an exact-case match would silently
+ * over-filter. IDs are numeric strings, so lowercasing them is a harmless no-op.
+ */
+export function isChannelInScope(
+  channel: { id: string; name: string },
+  allowlist: string[] | null
+): boolean {
+  if (!allowlist) return true;
+  const set = new Set(allowlist.map((s) => s.toLowerCase()));
+  return (
+    set.has(channel.id.toLowerCase()) || set.has(channel.name.toLowerCase())
+  );
+}
+
 async function fetchTextChannels(authHeader: string): Promise<DiscordChannel[]> {
   const result = await apiGet(`/guilds/${GUILD_ID}/channels`, authHeader);
   if (!result.ok) {
     throw new Error(`Failed to fetch channels: HTTP ${result.status}`);
   }
+  // Poll EVERY text channel — required so --dangerously-load-development-channels
+  // can inject. Cross-team scoping happens at the deliver layer (isChannelInScope
+  // at the delivery point), not here.
   return (result.data as DiscordChannel[]).filter((c) => c.type === 0);
 }
 
@@ -868,6 +951,14 @@ async function checkForNewMessages(
 
       // Update baseline to the newest message (messages are newest-first)
       lastSeenMessageId.set(channel.id, messages[0].id);
+
+      // Deliver-layer channel scope (#31): the watcher polls every channel (so
+      // injection works), but only DELIVERS from allowlisted channels. Baseline
+      // is already advanced above, so out-of-scope channels are tracked but
+      // never delivered — this is the cross-team leak fix, at the deliver layer.
+      if (!isChannelInScope(channel, CHANNEL_ALLOWLIST)) {
+        continue;
+      }
 
       // Push a wake-up notification for each new message (oldest first)
       for (const msg of messages.reverse()) {

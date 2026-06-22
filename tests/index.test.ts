@@ -13,6 +13,8 @@ import type { DiscordMessage, DiscordAttachment, DiscordConfig } from "../index"
 import {
   stripTokenPunctuation,
   loadConfig,
+  computeChannelAllowlist,
+  isChannelInScope,
   checkKillSwitch,
   engageKillSwitch,
   checkAuthFailed,
@@ -1425,5 +1427,108 @@ describe("scream-hole source integration", () => {
     // Health check must extract origin to avoid hitting /api/v10/health
     expect(src).toContain("extractOrigin(url)");
     expect(src).toContain("${origin}/health");
+  });
+});
+
+// --- Channel poll-scope allowlist (#31 cross-team leak fix) -------------------
+
+describe("computeChannelAllowlist", () => {
+  test("unset config + unset env → null (backward-compatible poll-all)", () => {
+    expect(computeChannelAllowlist({}, undefined)).toBeNull();
+  });
+
+  test("empty env string → null", () => {
+    expect(computeChannelAllowlist({}, "")).toBeNull();
+  });
+
+  test("env comma-separated → trimmed array", () => {
+    expect(computeChannelAllowlist({}, "123, 456 ,oaw")).toEqual([
+      "123",
+      "456",
+      "oaw",
+    ]);
+  });
+
+  test("env with only whitespace/commas → null", () => {
+    expect(computeChannelAllowlist({}, " , , ")).toBeNull();
+  });
+
+  test("config.watcher_channels (array) → used", () => {
+    expect(
+      computeChannelAllowlist({ watcher_channels: ["111", "oaw"] }, undefined)
+    ).toEqual(["111", "oaw"]);
+  });
+
+  test("config takes precedence over env", () => {
+    expect(
+      computeChannelAllowlist({ watcher_channels: ["fromConfig"] }, "fromEnv")
+    ).toEqual(["fromConfig"]);
+  });
+
+  test("empty config array falls through to env", () => {
+    expect(
+      computeChannelAllowlist({ watcher_channels: [] }, "fromEnv")
+    ).toEqual(["fromEnv"]);
+  });
+
+  test("non-array config.watcher_channels is ignored → falls through to env", () => {
+    expect(
+      computeChannelAllowlist(
+        { watcher_channels: "oaw,roll-call" as unknown as string[] },
+        "fromEnv"
+      )
+    ).toEqual(["fromEnv"]);
+  });
+
+  test("non-array config + no env → null (poll-all, not a crash)", () => {
+    expect(
+      computeChannelAllowlist(
+        { watcher_channels: "oaw" as unknown as string[] },
+        undefined
+      )
+    ).toBeNull();
+  });
+});
+
+describe("isChannelInScope", () => {
+  const ch = (id: string, name: string) => ({ id, name });
+
+  test("null allowlist → every channel in scope (backward-compat)", () => {
+    expect(isChannelInScope(ch("200", "ams-clusterfuck"), null)).toBe(true);
+  });
+
+  test("in scope by channel id", () => {
+    expect(isChannelInScope(ch("100", "oaw"), ["100", "300"])).toBe(true);
+  });
+
+  test("in scope by channel name", () => {
+    expect(isChannelInScope(ch("100", "oaw"), ["oaw", "roll-call"])).toBe(true);
+  });
+
+  test("foreign-team channel is out of scope — the cross-team leak fix", () => {
+    expect(
+      isChannelInScope(ch("200", "ams-clusterfuck"), ["oaw", "roll-call"])
+    ).toBe(false);
+  });
+
+  test("empty allowlist → nothing in scope (explicit empty scope)", () => {
+    expect(isChannelInScope(ch("100", "oaw"), [])).toBe(false);
+  });
+
+  test("non-matching allowlist entry → out of scope (no false positives)", () => {
+    expect(isChannelInScope(ch("100", "oaw"), ["nonexistent"])).toBe(false);
+  });
+
+  test("name match is case-insensitive (UI lowercases, API may not)", () => {
+    expect(isChannelInScope(ch("100", "OAW"), ["oaw"])).toBe(true);
+  });
+
+  test("mixed-case allowlist entry matches lowercase channel name", () => {
+    expect(isChannelInScope(ch("100", "oaw"), ["OAW"])).toBe(true);
+  });
+
+  test("id and name are interchangeable", () => {
+    expect(isChannelInScope(ch("300", "roll-call"), ["300"])).toBe(true);
+    expect(isChannelInScope(ch("300", "roll-call"), ["roll-call"])).toBe(true);
   });
 });
