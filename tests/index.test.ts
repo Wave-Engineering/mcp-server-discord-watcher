@@ -305,6 +305,83 @@ describe("resolveIdentity", () => {
   });
 });
 
+// #32 + #34 + #723: durable identity path under the locked root contract
+// (CLAUDE_PROJECT_DIR). Behavioral fs tests — point CLAUDE_PROJECT_DIR at a scratch
+// root, write real identity files, and assert resolveIdentity's actual return.
+// These replace the prior source-introspection checks, which were behavior-blind
+// and passed even with the shadowing bug present (mother's #34 finding).
+describe("identity durable-path resolution (#32/#34)", () => {
+  let tmpRoot: string;
+  let legacyTmpFile: string;
+  const savedProjectDir = process.env.CLAUDE_PROJECT_DIR;
+
+  beforeEach(async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { createHash } = await import("node:crypto");
+    tmpRoot = mkdtempSync(join(tmpdir(), "ident-"));
+    process.env.CLAUDE_PROJECT_DIR = tmpRoot;
+    // resolveIdentity keys the legacy file on md5(projectRoot) under /tmp.
+    const dirHash = createHash("md5").update(tmpRoot).digest("hex");
+    legacyTmpFile = `/tmp/claude-agent-${dirHash}.json`;
+  });
+
+  afterEach(async () => {
+    const { rmSync, existsSync } = await import("node:fs");
+    rmSync(tmpRoot, { recursive: true, force: true });
+    if (existsSync(legacyTmpFile)) rmSync(legacyTmpFile, { force: true });
+    if (savedProjectDir === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+    else process.env.CLAUDE_PROJECT_DIR = savedProjectDir;
+  });
+
+  async function writeDurable(obj: unknown): Promise<void> {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    mkdirSync(join(tmpRoot, ".claude"), { recursive: true });
+    writeFileSync(
+      join(tmpRoot, ".claude", "agent-identity.json"),
+      JSON.stringify(obj)
+    );
+  }
+  async function writeLegacy(obj: unknown): Promise<void> {
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(legacyTmpFile, JSON.stringify(obj));
+  }
+
+  test("anchors on CLAUDE_PROJECT_DIR and reads the durable .claude/agent-identity.json under it", async () => {
+    const { resolveIdentity } = await import("../index");
+    await writeDurable({ dev_name: "polyjuice", dev_team: "oaw" });
+    expect(resolveIdentity()).toEqual({ devName: "polyjuice", devTeam: "oaw" });
+  });
+
+  test("durable present and valid → legacy /tmp is ignored", async () => {
+    const { resolveIdentity } = await import("../index");
+    await writeDurable({ dev_name: "polyjuice", dev_team: "oaw" });
+    await writeLegacy({ dev_name: "STALE", dev_team: "STALE" });
+    expect(resolveIdentity()).toEqual({ devName: "polyjuice", devTeam: "oaw" });
+  });
+
+  test("empty {} durable file does NOT shadow a valid /tmp identity (#34 shadowing fix)", async () => {
+    const { resolveIdentity } = await import("../index");
+    await writeDurable({}); // parses, but yields no usable fields
+    await writeLegacy({ dev_name: "polyjuice", dev_team: "oaw" });
+    expect(resolveIdentity()).toEqual({ devName: "polyjuice", devTeam: "oaw" });
+  });
+
+  test("partial durable file (missing dev_team) falls through to a complete /tmp identity", async () => {
+    const { resolveIdentity } = await import("../index");
+    await writeDurable({ dev_name: "polyjuice" }); // incomplete — must not be accepted
+    await writeLegacy({ dev_name: "polyjuice", dev_team: "oaw" });
+    expect(resolveIdentity()).toEqual({ devName: "polyjuice", devTeam: "oaw" });
+  });
+
+  test("neither file present → {null, null}", async () => {
+    const { resolveIdentity } = await import("../index");
+    expect(resolveIdentity()).toEqual({ devName: null, devTeam: null });
+  });
+});
+
 // --- AgentIdentity interface tests -------------------------------------------
 
 describe("AgentIdentity interface", () => {
@@ -512,6 +589,28 @@ describe("shouldDeliverMessage", () => {
     expect(shouldDeliverMessage(msg, noIdentity)).toBe(false);
   });
 
+  // #32: tighten fail-closed to ANY unresolved field, not only both-null
+  test("FAIL CLOSED: drops on partial identity (devTeam null) even on @all", () => {
+    const msg = makeMsg({ content: "@all everyone read this" });
+    expect(shouldDeliverMessage(msg, identity({ devTeam: null }))).toBe(false);
+  });
+
+  test("FAIL CLOSED: drops on partial identity (devName null) even on @<team>", () => {
+    const msg = makeMsg({ content: "@mcp-server-discord-watcher ship it" });
+    expect(shouldDeliverMessage(msg, identity({ devName: null }))).toBe(false);
+  });
+
+  test("FAIL CLOSED: empty-string fields count as unresolved", () => {
+    const msg = makeMsg({ content: "@all hi" });
+    expect(shouldDeliverMessage(msg, { devName: "", devTeam: "oaw" })).toBe(false);
+    expect(shouldDeliverMessage(msg, { devName: "oaw", devTeam: "" })).toBe(false);
+  });
+
+  test("still delivers on a fully-resolved identity (no regression)", () => {
+    const msg = makeMsg({ content: "@all standup" });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
   test("FAIL CLOSED: drops even @all when identity is unresolved", () => {
     // The most surprising case: even broadcasts fail closed for unidentified
     // agents. Better silence than cross-project leakage.
@@ -520,10 +619,13 @@ describe("shouldDeliverMessage", () => {
     expect(shouldDeliverMessage(msg, noIdentity)).toBe(false);
   });
 
-  test("FAIL CLOSED: still delivers when at least devTeam is resolved", () => {
+  test("FAIL CLOSED: drops on partial identity (devName null), even with @<team> match — #32 tightened from both-null", () => {
     const msg = makeMsg({ content: "@my-team ship it" });
     const partialIdentity = { devName: null, devTeam: "my-team" };
-    expect(shouldDeliverMessage(msg, partialIdentity)).toBe(true);
+    // Pre-#32 this delivered (fail-closed fired only when BOTH fields were null).
+    // #32 fails closed on ANY unresolved field — a partial identity is exactly
+    // the over-broad risk we're closing. Deaf > over-broad.
+    expect(shouldDeliverMessage(msg, partialIdentity)).toBe(false);
   });
 
   // --- Self-echo filter still works ---

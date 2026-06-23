@@ -13,7 +13,6 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from "node:fs";
-import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { sanitizeSurrogates } from "./sanitize.ts";
@@ -380,27 +379,72 @@ export interface AgentIdentity {
 let cachedIdentity: AgentIdentity = { devName: null, devTeam: null };
 
 export function resolveIdentity(): AgentIdentity {
-  try {
-    // Match the agent's identity resolution: git rev-parse, fallback to cwd
-    let projectRoot: string;
+  // Claude Code sets CLAUDE_PROJECT_DIR in every spawned MCP server's environment
+  // to the session project root (the locked identity-path contract) — it is the
+  // authoritative root and is immune to cwd drift. Fall back to process.cwd() only
+  // if it is somehow unset. We dropped `git rev-parse --show-toplevel`, which
+  // returned the *wrong* toplevel whenever the watcher's cwd sat inside an
+  // unrelated git repo — the nested-repo hazard cacophonix flagged on #34.
+  const projectRoot = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+
+  // Read order (cc-workflow #723): the durable project-local file first, then
+  // the legacy /tmp path during the transition window. /tmp is emptied on every
+  // reboot (systemd-tmpfiles `D /tmp`), so a watcher that booted after a reboot
+  // resolved a null identity from /tmp — the null-at-boot over-broad bleed. The
+  // project-local `.claude/` file survives reboots.
+  const durableFile = join(projectRoot, ".claude", "agent-identity.json");
+  const dirHash = createHash("md5").update(projectRoot).digest("hex");
+  const legacyTmpFile = `/tmp/claude-agent-${dirHash}.json`;
+
+  for (const file of [durableFile, legacyTmpFile]) {
     try {
-      projectRoot = execSync("git rev-parse --show-toplevel", {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
+      const data = JSON.parse(readFileSync(file, "utf-8"));
+      const devName = data.dev_name || null;
+      const devTeam = data.dev_team || null;
+      // A file that parses but yields no usable identity (empty `{}`, half-written,
+      // or null fields) must NOT shadow a complete identity in a later location.
+      // Require BOTH fields — matching the fail-closed delivery contract — and
+      // otherwise fall through to the next file (mother's #34 shadowing finding).
+      if (devName && devTeam) {
+        return { devName, devTeam };
+      }
     } catch {
-      projectRoot = process.cwd();
+      // not present / unreadable — try the next location
     }
-    const dirHash = createHash("md5").update(projectRoot).digest("hex");
-    const agentFile = `/tmp/claude-agent-${dirHash}.json`;
-    const data = JSON.parse(readFileSync(agentFile, "utf-8"));
-    return {
-      devName: data.dev_name || null,
-      devTeam: data.dev_team || null,
-    };
-  } catch {
-    return { devName: null, devTeam: null };
   }
+  // Unresolved. Emit a greppable breadcrumb with the resolved root and the exact
+  // paths tried, so a writer/reader root mismatch (identity written under a
+  // different project root) is diagnosable instead of degrading silently to a
+  // Claude/🤖/unknown fallout downstream (cacophonix's #34 note). Debug level: it
+  // runs every poll cycle while unresolved, so it must not become info-noise.
+  log.debug("identity_unresolved", {
+    project_root: projectRoot,
+    tried: [durableFile, legacyTmpFile],
+  });
+  return { devName: null, devTeam: null };
+}
+
+/**
+ * Re-resolve the agent identity and update the cache when it changes. Lets a
+ * watcher that booted before `/name` wrote the identity file (the /tmp-wipe /
+ * null-at-boot case) self-heal without a restart. Returns true if the identity
+ * changed. Logs on transition.
+ */
+export function refreshIdentity(): boolean {
+  const next = resolveIdentity();
+  if (
+    next.devName === cachedIdentity.devName &&
+    next.devTeam === cachedIdentity.devTeam
+  ) {
+    return false;
+  }
+  log.info("state_change", {
+    what: "identity",
+    from: `${cachedIdentity.devName}/${cachedIdentity.devTeam}`,
+    to: `${next.devName}/${next.devTeam}`,
+  });
+  cachedIdentity = next;
+  return true;
 }
 
 // --- Discord API helpers -----------------------------------------------------
@@ -545,9 +589,10 @@ export function shouldDeliverMessage(
     return false;
   }
 
-  // 3. Fail closed when identity is unresolved (precedes VERBOSE so the
-  // security boundary is preserved even in verbose mode)
-  if (!identity.devName && !identity.devTeam) {
+  // 3. Fail closed on ANY unresolved identity field (devName OR devTeam null/
+  // empty), not only both-null — a partial identity can still match over-broad.
+  // Deaf > over-broad. Precedes VERBOSE so the boundary holds even in verbose.
+  if (!identity.devName || !identity.devTeam) {
     return false;
   }
 
@@ -905,8 +950,11 @@ async function checkForNewMessages(
     return;
   }
 
-  // Refresh identity each cycle (agent may pick name after server starts)
-  cachedIdentity = resolveIdentity();
+  // Re-resolve identity each cycle: the agent may pick/re-roll its name after
+  // the server starts, and the durable identity file can appear post-boot.
+  // refreshIdentity() updates the cache AND logs the transition (the null-at-boot
+  // self-heal) — the channel already re-resolved every cycle; this adds the log.
+  refreshIdentity();
 
   const cycleVia = API_BASE === DISCORD_API_BASE ? "direct" : "scream-hole";
   log.debug("poll", { via: cycleVia, api_base: API_BASE });
