@@ -305,6 +305,42 @@ describe("resolveIdentity", () => {
   });
 });
 
+// #32 + #723: durable identity path (reboot-survivable) + hot-reload self-heal.
+// These touch git rev-parse + real fs from the process root, so we assert the
+// wiring via source introspection (the repo's established pattern for module-
+// level / fs-coupled code — see STT and INSTRUCTIONS tests above).
+describe("identity durable-path + hot-reload (#32)", () => {
+  async function source(): Promise<string> {
+    const { readFileSync } = await import("node:fs");
+    return readFileSync(
+      new URL("../index.ts", import.meta.url).pathname,
+      "utf-8"
+    );
+  }
+
+  test("resolveIdentity reads the durable .claude/agent-identity.json path", async () => {
+    const s = await source();
+    expect(s).toContain('join(projectRoot, ".claude", "agent-identity.json")');
+  });
+
+  test("resolveIdentity tries the durable path BEFORE the legacy /tmp path", async () => {
+    const s = await source();
+    expect(s).toContain("for (const file of [durableFile, legacyTmpFile])");
+    expect(s.indexOf("const durableFile")).toBeLessThan(
+      s.indexOf("const legacyTmpFile")
+    );
+  });
+
+  test("the poll loop re-resolves identity via refreshIdentity (hot-reload + logging)", async () => {
+    const s = await source();
+    expect(s).toContain("export function refreshIdentity()");
+    // The poll loop re-resolves each cycle via refreshIdentity() — which logs on
+    // transition — instead of a bare assignment, so identity changes are logged.
+    expect(s).not.toContain("cachedIdentity = resolveIdentity();");
+    expect(s).toContain("refreshIdentity();");
+  });
+});
+
 // --- AgentIdentity interface tests -------------------------------------------
 
 describe("AgentIdentity interface", () => {
@@ -512,6 +548,28 @@ describe("shouldDeliverMessage", () => {
     expect(shouldDeliverMessage(msg, noIdentity)).toBe(false);
   });
 
+  // #32: tighten fail-closed to ANY unresolved field, not only both-null
+  test("FAIL CLOSED: drops on partial identity (devTeam null) even on @all", () => {
+    const msg = makeMsg({ content: "@all everyone read this" });
+    expect(shouldDeliverMessage(msg, identity({ devTeam: null }))).toBe(false);
+  });
+
+  test("FAIL CLOSED: drops on partial identity (devName null) even on @<team>", () => {
+    const msg = makeMsg({ content: "@mcp-server-discord-watcher ship it" });
+    expect(shouldDeliverMessage(msg, identity({ devName: null }))).toBe(false);
+  });
+
+  test("FAIL CLOSED: empty-string fields count as unresolved", () => {
+    const msg = makeMsg({ content: "@all hi" });
+    expect(shouldDeliverMessage(msg, { devName: "", devTeam: "oaw" })).toBe(false);
+    expect(shouldDeliverMessage(msg, { devName: "oaw", devTeam: "" })).toBe(false);
+  });
+
+  test("still delivers on a fully-resolved identity (no regression)", () => {
+    const msg = makeMsg({ content: "@all standup" });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
   test("FAIL CLOSED: drops even @all when identity is unresolved", () => {
     // The most surprising case: even broadcasts fail closed for unidentified
     // agents. Better silence than cross-project leakage.
@@ -520,10 +578,13 @@ describe("shouldDeliverMessage", () => {
     expect(shouldDeliverMessage(msg, noIdentity)).toBe(false);
   });
 
-  test("FAIL CLOSED: still delivers when at least devTeam is resolved", () => {
+  test("FAIL CLOSED: drops on partial identity (devName null), even with @<team> match — #32 tightened from both-null", () => {
     const msg = makeMsg({ content: "@my-team ship it" });
     const partialIdentity = { devName: null, devTeam: "my-team" };
-    expect(shouldDeliverMessage(msg, partialIdentity)).toBe(true);
+    // Pre-#32 this delivered (fail-closed fired only when BOTH fields were null).
+    // #32 fails closed on ANY unresolved field — a partial identity is exactly
+    // the over-broad risk we're closing. Deaf > over-broad.
+    expect(shouldDeliverMessage(msg, partialIdentity)).toBe(false);
   });
 
   // --- Self-echo filter still works ---
