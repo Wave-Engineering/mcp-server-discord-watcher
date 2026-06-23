@@ -13,7 +13,6 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from "node:fs";
-import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { sanitizeSurrogates } from "./sanitize.ts";
@@ -380,16 +379,13 @@ export interface AgentIdentity {
 let cachedIdentity: AgentIdentity = { devName: null, devTeam: null };
 
 export function resolveIdentity(): AgentIdentity {
-  // Match the agent's identity resolution: git rev-parse, fallback to cwd
-  let projectRoot: string;
-  try {
-    projectRoot = execSync("git rev-parse --show-toplevel", {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-  } catch {
-    projectRoot = process.cwd();
-  }
+  // Claude Code sets CLAUDE_PROJECT_DIR in every spawned MCP server's environment
+  // to the session project root (the locked identity-path contract) — it is the
+  // authoritative root and is immune to cwd drift. Fall back to process.cwd() only
+  // if it is somehow unset. We dropped `git rev-parse --show-toplevel`, which
+  // returned the *wrong* toplevel whenever the watcher's cwd sat inside an
+  // unrelated git repo — the nested-repo hazard cacophonix flagged on #34.
+  const projectRoot = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
 
   // Read order (cc-workflow #723): the durable project-local file first, then
   // the legacy /tmp path during the transition window. /tmp is emptied on every
@@ -403,14 +399,28 @@ export function resolveIdentity(): AgentIdentity {
   for (const file of [durableFile, legacyTmpFile]) {
     try {
       const data = JSON.parse(readFileSync(file, "utf-8"));
-      return {
-        devName: data.dev_name || null,
-        devTeam: data.dev_team || null,
-      };
+      const devName = data.dev_name || null;
+      const devTeam = data.dev_team || null;
+      // A file that parses but yields no usable identity (empty `{}`, half-written,
+      // or null fields) must NOT shadow a complete identity in a later location.
+      // Require BOTH fields — matching the fail-closed delivery contract — and
+      // otherwise fall through to the next file (mother's #34 shadowing finding).
+      if (devName && devTeam) {
+        return { devName, devTeam };
+      }
     } catch {
       // not present / unreadable — try the next location
     }
   }
+  // Unresolved. Emit a greppable breadcrumb with the resolved root and the exact
+  // paths tried, so a writer/reader root mismatch (identity written under a
+  // different project root) is diagnosable instead of degrading silently to a
+  // Claude/🤖/unknown fallout downstream (cacophonix's #34 note). Debug level: it
+  // runs every poll cycle while unresolved, so it must not become info-noise.
+  log.debug("identity_unresolved", {
+    project_root: projectRoot,
+    tried: [durableFile, legacyTmpFile],
+  });
   return { devName: null, devTeam: null };
 }
 

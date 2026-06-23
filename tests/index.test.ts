@@ -305,39 +305,80 @@ describe("resolveIdentity", () => {
   });
 });
 
-// #32 + #723: durable identity path (reboot-survivable) + hot-reload self-heal.
-// These touch git rev-parse + real fs from the process root, so we assert the
-// wiring via source introspection (the repo's established pattern for module-
-// level / fs-coupled code — see STT and INSTRUCTIONS tests above).
-describe("identity durable-path + hot-reload (#32)", () => {
-  async function source(): Promise<string> {
-    const { readFileSync } = await import("node:fs");
-    return readFileSync(
-      new URL("../index.ts", import.meta.url).pathname,
-      "utf-8"
+// #32 + #34 + #723: durable identity path under the locked root contract
+// (CLAUDE_PROJECT_DIR). Behavioral fs tests — point CLAUDE_PROJECT_DIR at a scratch
+// root, write real identity files, and assert resolveIdentity's actual return.
+// These replace the prior source-introspection checks, which were behavior-blind
+// and passed even with the shadowing bug present (mother's #34 finding).
+describe("identity durable-path resolution (#32/#34)", () => {
+  let tmpRoot: string;
+  let legacyTmpFile: string;
+  const savedProjectDir = process.env.CLAUDE_PROJECT_DIR;
+
+  beforeEach(async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { createHash } = await import("node:crypto");
+    tmpRoot = mkdtempSync(join(tmpdir(), "ident-"));
+    process.env.CLAUDE_PROJECT_DIR = tmpRoot;
+    // resolveIdentity keys the legacy file on md5(projectRoot) under /tmp.
+    const dirHash = createHash("md5").update(tmpRoot).digest("hex");
+    legacyTmpFile = `/tmp/claude-agent-${dirHash}.json`;
+  });
+
+  afterEach(async () => {
+    const { rmSync, existsSync } = await import("node:fs");
+    rmSync(tmpRoot, { recursive: true, force: true });
+    if (existsSync(legacyTmpFile)) rmSync(legacyTmpFile, { force: true });
+    if (savedProjectDir === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+    else process.env.CLAUDE_PROJECT_DIR = savedProjectDir;
+  });
+
+  async function writeDurable(obj: unknown): Promise<void> {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    mkdirSync(join(tmpRoot, ".claude"), { recursive: true });
+    writeFileSync(
+      join(tmpRoot, ".claude", "agent-identity.json"),
+      JSON.stringify(obj)
     );
   }
+  async function writeLegacy(obj: unknown): Promise<void> {
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(legacyTmpFile, JSON.stringify(obj));
+  }
 
-  test("resolveIdentity reads the durable .claude/agent-identity.json path", async () => {
-    const s = await source();
-    expect(s).toContain('join(projectRoot, ".claude", "agent-identity.json")');
+  test("anchors on CLAUDE_PROJECT_DIR and reads the durable .claude/agent-identity.json under it", async () => {
+    const { resolveIdentity } = await import("../index");
+    await writeDurable({ dev_name: "polyjuice", dev_team: "oaw" });
+    expect(resolveIdentity()).toEqual({ devName: "polyjuice", devTeam: "oaw" });
   });
 
-  test("resolveIdentity tries the durable path BEFORE the legacy /tmp path", async () => {
-    const s = await source();
-    expect(s).toContain("for (const file of [durableFile, legacyTmpFile])");
-    expect(s.indexOf("const durableFile")).toBeLessThan(
-      s.indexOf("const legacyTmpFile")
-    );
+  test("durable present and valid → legacy /tmp is ignored", async () => {
+    const { resolveIdentity } = await import("../index");
+    await writeDurable({ dev_name: "polyjuice", dev_team: "oaw" });
+    await writeLegacy({ dev_name: "STALE", dev_team: "STALE" });
+    expect(resolveIdentity()).toEqual({ devName: "polyjuice", devTeam: "oaw" });
   });
 
-  test("the poll loop re-resolves identity via refreshIdentity (hot-reload + logging)", async () => {
-    const s = await source();
-    expect(s).toContain("export function refreshIdentity()");
-    // The poll loop re-resolves each cycle via refreshIdentity() — which logs on
-    // transition — instead of a bare assignment, so identity changes are logged.
-    expect(s).not.toContain("cachedIdentity = resolveIdentity();");
-    expect(s).toContain("refreshIdentity();");
+  test("empty {} durable file does NOT shadow a valid /tmp identity (#34 shadowing fix)", async () => {
+    const { resolveIdentity } = await import("../index");
+    await writeDurable({}); // parses, but yields no usable fields
+    await writeLegacy({ dev_name: "polyjuice", dev_team: "oaw" });
+    expect(resolveIdentity()).toEqual({ devName: "polyjuice", devTeam: "oaw" });
+  });
+
+  test("partial durable file (missing dev_team) falls through to a complete /tmp identity", async () => {
+    const { resolveIdentity } = await import("../index");
+    await writeDurable({ dev_name: "polyjuice" }); // incomplete — must not be accepted
+    await writeLegacy({ dev_name: "polyjuice", dev_team: "oaw" });
+    expect(resolveIdentity()).toEqual({ devName: "polyjuice", devTeam: "oaw" });
+  });
+
+  test("neither file present → {null, null}", async () => {
+    const { resolveIdentity } = await import("../index");
+    expect(resolveIdentity()).toEqual({ devName: null, devTeam: null });
   });
 });
 
