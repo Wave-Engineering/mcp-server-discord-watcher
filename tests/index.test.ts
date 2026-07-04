@@ -28,6 +28,7 @@ import {
   isReplyToOurSignature,
   nextChannelJitterMs,
   refreshChannelList,
+  refreshIdentity,
   DISCORD_API_BASE,
 } from "../index";
 import type { AgentIdentity } from "../index";
@@ -1632,5 +1633,82 @@ describe("isChannelInScope", () => {
   test("id and name are interchangeable", () => {
     expect(isChannelInScope(ch("300", "roll-call"), ["300"])).toBe(true);
     expect(isChannelInScope(ch("300", "roll-call"), ["roll-call"])).toBe(true);
+  });
+});
+
+// --- refreshIdentity startup self-registration (#38) -------------------------
+//
+// Regression suite for issue #38. The watcher previously populated cachedIdentity
+// only on the first poll cycle (15 seconds after startup). Doorbells arriving in
+// that window were dropped via the fail-closed null-identity guard. The fix calls
+// refreshIdentity() in main() before the setInterval, so the cache is warm before
+// any message can arrive.
+
+describe("refreshIdentity startup self-registration (#38)", () => {
+  let tmpRoot: string;
+  const savedProjectDir = process.env.CLAUDE_PROJECT_DIR;
+
+  beforeEach(async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    tmpRoot = mkdtempSync(join(tmpdir(), "startup-ident-"));
+    process.env.CLAUDE_PROJECT_DIR = tmpRoot;
+  });
+
+  afterEach(async () => {
+    const { rmSync } = await import("node:fs");
+    rmSync(tmpRoot, { recursive: true, force: true });
+    if (savedProjectDir === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+    else process.env.CLAUDE_PROJECT_DIR = savedProjectDir;
+  });
+
+  test("refreshIdentity returns true when a new identity appears (cache miss)", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    // Use a timestamp-derived name to guarantee it differs from any cached state
+    const uniqueName = `test-startup-${Date.now()}`;
+    mkdirSync(join(tmpRoot, ".claude"), { recursive: true });
+    writeFileSync(
+      join(tmpRoot, ".claude", "agent-identity.json"),
+      JSON.stringify({ dev_name: uniqueName, dev_team: "oaw" })
+    );
+    const changed = refreshIdentity();
+    expect(changed).toBe(true);
+  });
+
+  test("refreshIdentity is idempotent — second call with same state returns false", async () => {
+    // Call twice in the same env state: second call must not report a change
+    refreshIdentity();
+    const result = refreshIdentity();
+    expect(result).toBe(false);
+  });
+
+  test("refreshIdentity with no identity file does not throw", () => {
+    // No .claude/agent-identity.json in tmpRoot — must not crash
+    expect(() => refreshIdentity()).not.toThrow();
+  });
+
+  test("refreshIdentity with malformed JSON does not throw", async () => {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    mkdirSync(join(tmpRoot, ".claude"), { recursive: true });
+    writeFileSync(join(tmpRoot, ".claude", "agent-identity.json"), "{ bad json }}}");
+    expect(() => refreshIdentity()).not.toThrow();
+  });
+
+  test("main() calls refreshIdentity() before the poll setInterval (source verification)", () => {
+    const { readFileSync } = require("node:fs");
+    const src = readFileSync(
+      new URL("../index.ts", import.meta.url).pathname,
+      "utf-8"
+    );
+    const mainFnIndex = src.indexOf("async function main()");
+    expect(mainFnIndex).toBeGreaterThan(0);
+    const refreshCallIndex = src.indexOf("refreshIdentity()", mainFnIndex);
+    const pollTimerIndex = src.indexOf("setInterval", mainFnIndex);
+    // refreshIdentity() must appear inside main() and before the first setInterval
+    expect(refreshCallIndex).toBeGreaterThan(mainFnIndex);
+    expect(refreshCallIndex).toBeLessThan(pollTimerIndex);
   });
 });

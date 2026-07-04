@@ -1091,6 +1091,13 @@ async function main(): Promise<void> {
   // bad, the first apiGet 401 will re-engage the circuit breaker.
   clearAuthFailed();
 
+  // Pre-populate the identity cache from agent-identity.json if it already
+  // exists. Each poll already calls refreshIdentity() before delivery, but
+  // the first poll is 15 s away — this logs the identity transition and warms
+  // the cache earlier. refreshIdentity() handles absent/malformed files
+  // gracefully (silent skip, no crash).
+  refreshIdentity();
+
   // Load token early — fail fast before MCP transport setup
   const token = loadToken();
   const authHeader = `Bot ${token}`;
