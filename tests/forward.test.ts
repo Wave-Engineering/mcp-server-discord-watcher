@@ -21,11 +21,13 @@ import {
   isForwardLoop,
   shouldForward,
   forwardMessage,
+  shouldFallbackToLocalNotify,
   forwardHeader,
   normalizeToken,
   type ForwardRule,
   type ForwardableMessage,
   type ForwardableChannel,
+  type ForwardOutcome,
 } from "../forward.ts";
 import { refreshForwardRule, currentForwardRule } from "../index.ts";
 import type { DeliveryResult, DeliveryTarget } from "../deliver/types.ts";
@@ -252,10 +254,10 @@ describe("forwardMessage", () => {
     return { fn, calls };
   }
 
-  test("fetches full content, delivers it with header + msg.id idempotency", async () => {
+  test("found → fetches full content, delivers it with header + msg.id idempotency", async () => {
     const { fn, calls } = fakeDeliver();
     const out = await forwardMessage(rule(), CH, makeMsg({ id: "m-42" }), "Bot t", {
-      fetchMessage: async () => ({ content: "the full body" }),
+      fetchMessage: async () => ({ kind: "found", message: { content: "the full body" } }),
       deliverFn: fn as any,
     });
     expect(out.forwarded).toBe(true);
@@ -266,19 +268,31 @@ describe("forwardMessage", () => {
     expect(calls[0].opts?.id).toBe("m-42"); // idempotency = Discord message id
   });
 
-  test("fetch returns null → nothing forwarded, deliver never called", async () => {
+  test("gone (real 404) → dropped, deliver never called, no local fallback", async () => {
     const { fn, calls } = fakeDeliver();
     const out = await forwardMessage(rule(), CH, makeMsg(), "Bot t", {
-      fetchMessage: async () => null,
+      fetchMessage: async () => ({ kind: "gone" }),
       deliverFn: fn as any,
     });
-    expect(out).toEqual({ forwarded: false, reason: "fetch_null" });
+    expect(out).toEqual({ forwarded: false, reason: "gone" });
     expect(calls).toHaveLength(0);
+    expect(shouldFallbackToLocalNotify(out)).toBe(false);
+  });
+
+  test("error (transient) → not forwarded, deliver never called, falls back to local notify", async () => {
+    const { fn, calls } = fakeDeliver();
+    const out = await forwardMessage(rule(), CH, makeMsg(), "Bot t", {
+      fetchMessage: async () => ({ kind: "error" }),
+      deliverFn: fn as any,
+    });
+    expect(out).toEqual({ forwarded: false, reason: "fetch_error" });
+    expect(calls).toHaveLength(0);
+    expect(shouldFallbackToLocalNotify(out)).toBe(true);
   });
 
   test("a delivery failure is reported, not thrown (poll-loop safe)", async () => {
     const out = await forwardMessage(rule(), CH, makeMsg(), "Bot t", {
-      fetchMessage: async () => ({ content: "body" }),
+      fetchMessage: async () => ({ kind: "found", message: { content: "body" } }),
       deliverFn: (async () => ({ ok: false, transport: "aoe", id: "m", error: "aoe send exited 1" })) as any,
     });
     expect(out.forwarded).toBe(true);
@@ -292,6 +306,33 @@ describe("forwardMessage", () => {
       },
     });
     expect(out).toEqual({ forwarded: false, reason: "exception" });
+  });
+});
+
+// --- shouldFallbackToLocalNotify: the transient-error fall-through decision --
+
+describe("shouldFallbackToLocalNotify", () => {
+  test("transient fetch error → fall back to local notify", () => {
+    const out: ForwardOutcome = { forwarded: false, reason: "fetch_error" };
+    expect(shouldFallbackToLocalNotify(out)).toBe(true);
+  });
+
+  test("real 404 (gone) → drop, do NOT notify local", () => {
+    const out: ForwardOutcome = { forwarded: false, reason: "gone" };
+    expect(shouldFallbackToLocalNotify(out)).toBe(false);
+  });
+
+  test("unexpected exception → drop, do NOT notify local", () => {
+    const out: ForwardOutcome = { forwarded: false, reason: "exception" };
+    expect(shouldFallbackToLocalNotify(out)).toBe(false);
+  });
+
+  test("delivered → already reached the target, do NOT notify local", () => {
+    const out: ForwardOutcome = {
+      forwarded: true,
+      result: { ok: true, transport: "aoe", id: "m" } as DeliveryResult,
+    };
+    expect(shouldFallbackToLocalNotify(out)).toBe(false);
   });
 });
 

@@ -26,9 +26,11 @@ import {
   resolveForwardRule,
   shouldForward,
   forwardMessage,
+  shouldFallbackToLocalNotify,
   type ForwardRule,
   type ForwardableMessage,
   type ForwardableChannel,
+  type FetchMessageResult,
 } from "./forward.ts";
 import {
   parseDirectMsgArgs,
@@ -1002,23 +1004,35 @@ async function fetchAllNewMessages(
  * peer disc-server exposes the same primitive to agents as `disc_read`'s
  * `message_id` param; this is the in-process counterpart for the forwarder.
  *
- * Returns the message, or `null` on any non-OK response (404 deleted-parent, 403,
- * 401, 429, …) — the caller treats that as "nothing to forward". Deliberately
- * NOT wired into any forward/notify path yet (that is #68); this is prep only.
+ * Returns a discriminated {@link FetchMessageResult}: `found` with the message,
+ * `gone` on a genuine 404 (the message was deleted — nothing to forward), or
+ * `error` on any other failure (403 / 401 / 429 / 5xx, plus a network / timeout
+ * throw). The distinction is load-bearing for the forward path (#44): a `gone`
+ * message is dropped, but an `error` is transient and the addressed message must
+ * NOT be lost — the forwarder falls back to a local notify instead.
  */
 export async function fetchMessageById(
   channelId: string,
   messageId: string,
   authHeader: string
-): Promise<DiscordMessage | null> {
-  const result = await apiGet(
-    `/channels/${channelId}/messages/${messageId}`,
-    authHeader
-  );
-  if (!result.ok) {
-    return null;
+): Promise<FetchMessageResult<DiscordMessage>> {
+  try {
+    const result = await apiGet(
+      `/channels/${channelId}/messages/${messageId}`,
+      authHeader
+    );
+    if (result.ok) {
+      return { kind: "found", message: result.data as DiscordMessage };
+    }
+    // 404 = the message (or its parent) was deleted. Every other non-OK status
+    // (403 / 401 / 429 / 5xx) is transient from the forwarder's standpoint —
+    // the message likely still exists and should not be silently dropped.
+    if (result.status === 404) return { kind: "gone" };
+    return { kind: "error" };
+  } catch {
+    // Network / timeout — the fetch never completed. Transient by definition.
+    return { kind: "error" };
   }
-  return result.data as DiscordMessage;
 }
 
 /**
@@ -1205,11 +1219,18 @@ async function checkForNewMessages(
         if (decideNotifyRoute(msg, channel, cachedForwardRule, cachedIdentity) === "forward") {
           // Never throws — a failed fetch/delivery is logged and swallowed so
           // the poll loop can never crash on a forward (fire-and-forget).
-          await forwardMessage(cachedForwardRule!, channel, msg, authHeader, {
+          const outcome = await forwardMessage(cachedForwardRule!, channel, msg, authHeader, {
             fetchMessage: fetchMessageById,
             log,
           });
-          continue; // forwarded — do NOT notify the local agent
+          // Delivered, or dropped as a real 404 (gone) / unexpected exception →
+          // do NOT notify the local agent. A TRANSIENT fetch error (#44) is the
+          // one case that falls through: the addressed message likely still
+          // exists, so we reach the local notify path below — the same path a
+          // non-forwarded addressed message takes — rather than lose it.
+          if (!shouldFallbackToLocalNotify(outcome)) {
+            continue;
+          }
         }
 
         // Transcribe audio attachments if present
