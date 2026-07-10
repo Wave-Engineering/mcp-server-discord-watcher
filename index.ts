@@ -19,6 +19,15 @@ import { sanitizeSurrogates } from "./sanitize.ts";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLogger } from "@wave-engineering/mcp-logger";
+import {
+  parseForwardArgs,
+  writeForwardRule,
+  clearForwardRule,
+  resolveForwardRule,
+  shouldForward,
+  forwardMessage,
+  type ForwardRule,
+} from "./forward.ts";
 
 // --- Build-date query (early exit) ------------------------------------------
 
@@ -32,6 +41,39 @@ if (process.argv.includes("--builddate")) {
     process.stdout.write("unknown\n");
   }
   process.exit(0);
+}
+
+// --- `disc forward` command surface (early exit) -----------------------------
+//
+// Thin writer for the per-forwarder LOCAL rule (#68). The runtime forward at the
+// poll/notify step is the meat; this just records the rule the watcher re-reads
+// each cycle. Mirrors the `--builddate` early-exit convention.
+//
+//   discord-watcher forward <target> [--exclude a,b,c]   # install
+//   discord-watcher forward --off                        # remove
+//
+if (process.argv[2] === "forward") {
+  const parsed = parseForwardArgs(process.argv.slice(3));
+  if (parsed.off) {
+    const cleared = clearForwardRule();
+    process.stdout.write(
+      cleared ? "disc forward: rule cleared\n" : "disc forward: no rule to clear\n"
+    );
+    process.exit(0);
+  } else if (parsed.rule) {
+    writeForwardRule(parsed.rule);
+    const suffix = parsed.rule.exclude.length
+      ? ` (except: ${parsed.rule.exclude.join(", ")})`
+      : "";
+    process.stdout.write(
+      `disc forward: forwarding doorbells to ${parsed.rule.target.label}${suffix}\n`
+    );
+    process.exit(0);
+  }
+  process.stderr.write(
+    "usage: discord-watcher forward <target> [--exclude a,b,c] | forward --off\n"
+  );
+  process.exit(2);
 }
 
 // --- Configuration -----------------------------------------------------------
@@ -444,6 +486,36 @@ export function refreshIdentity(): boolean {
     to: `${next.devName}/${next.devTeam}`,
   });
   cachedIdentity = next;
+  return true;
+}
+
+// --- Forward rule (disc forward #68) -----------------------------------------
+//
+// A per-forwarder LOCAL rule, re-read every poll cycle (like the identity file
+// and the kill/auth sentinels) so an agent can install / change / remove it at
+// runtime with no watcher restart. `null` = no rule = today's behavior, exactly.
+
+let cachedForwardRule: ForwardRule | null = null;
+
+/** The forward rule in effect for the current cycle (null = notify locally). */
+export function currentForwardRule(): ForwardRule | null {
+  return cachedForwardRule;
+}
+
+/**
+ * Re-resolve the forward rule and update the cache when it changes. Logs on
+ * transition. Returns true if the rule changed this cycle.
+ */
+export function refreshForwardRule(): boolean {
+  const next = resolveForwardRule();
+  if (JSON.stringify(next) === JSON.stringify(cachedForwardRule)) {
+    return false;
+  }
+  log.info("state_change", {
+    what: "forward_rule",
+    to: next ? (next.target.label ?? next.target.session ?? "target") : "off",
+  });
+  cachedForwardRule = next;
   return true;
 }
 
@@ -987,6 +1059,10 @@ async function checkForNewMessages(
   // self-heal) — the channel already re-resolved every cycle; this adds the log.
   refreshIdentity();
 
+  // Re-read the forward rule each cycle (#68) — installable/removable at runtime
+  // without a watcher restart, same live-read lifecycle as the identity file.
+  refreshForwardRule();
+
   const cycleVia = API_BASE === DISCORD_API_BASE ? "direct" : "scream-hole";
   log.debug("poll", { via: cycleVia, api_base: API_BASE });
 
@@ -1053,6 +1129,23 @@ async function checkForNewMessages(
 
         markDelivered(msg.id);
         cycleNewMessages++;
+
+        // --- disc forward (#68) ---------------------------------------------
+        // If a forward rule is active AND this doorbell is not excluded (and is
+        // not a loop/echo), reroute it to the target: fetch the FULL content and
+        // deliver it via the deliver-router INSTEAD of notifying the local agent.
+        // Excluded traffic (the local agent's allowlist), a loop echo, or NO
+        // forward rule at all falls through to the unchanged notify path below —
+        // the no-rule path is byte-for-byte today's behavior.
+        if (cachedForwardRule && shouldForward(msg, channel, cachedForwardRule)) {
+          // Never throws — a failed fetch/delivery is logged and swallowed so
+          // the poll loop can never crash on a forward (fire-and-forget).
+          await forwardMessage(cachedForwardRule, channel, msg, authHeader, {
+            fetchMessage: fetchMessageById,
+            log,
+          });
+          continue; // forwarded — do NOT notify the local agent
+        }
 
         // Transcribe audio attachments if present
         const audioTranscription = await transcribeAudioAttachments(msg, authHeader);
