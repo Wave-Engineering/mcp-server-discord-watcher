@@ -27,7 +27,14 @@ import {
   shouldForward,
   forwardMessage,
   type ForwardRule,
+  type ForwardableMessage,
+  type ForwardableChannel,
 } from "./forward.ts";
+import {
+  parseDirectMsgArgs,
+  sendDirectMsg,
+  directMsgOverridesForward,
+} from "./directmsg.ts";
 
 // --- Build-date query (early exit) ------------------------------------------
 
@@ -74,6 +81,33 @@ if (process.argv[2] === "forward") {
     "usage: discord-watcher forward <target> [--exclude a,b,c] | forward --off\n"
   );
   process.exit(2);
+}
+
+// --- `//directmsg` send surface (early exit) ---------------------------------
+//
+// The SEND side of #69: push a distilled must-see straight to <target> via the
+// deliver-router (#67), bypassing any forward rule on the target — it reaches
+// the target even on a channels-disabled account. Mirrors the `forward` and
+// `--builddate` early-exit convention. The RECEIVE side (the precedence override
+// that keeps a directmsg from being forwarded away) lives at the notify step.
+//
+//   discord-watcher directmsg <target> <content...>   # alias: dm
+//
+if (process.argv[2] === "directmsg" || process.argv[2] === "dm") {
+  const { target, content } = parseDirectMsgArgs(process.argv.slice(3));
+  if (!target || !content) {
+    process.stderr.write(
+      "usage: discord-watcher directmsg <target> <content...>\n"
+    );
+    process.exit(2);
+  }
+  const result = await sendDirectMsg(target, content);
+  process.stdout.write(
+    result.ok
+      ? `//directmsg: delivered to ${target} via ${result.transport}\n`
+      : `//directmsg: FAILED to reach ${target} (${result.error ?? "no transport"})\n`
+  );
+  process.exit(result.ok ? 0 : 1);
 }
 
 // --- Configuration -----------------------------------------------------------
@@ -517,6 +551,36 @@ export function refreshForwardRule(): boolean {
   });
   cachedForwardRule = next;
   return true;
+}
+
+// --- Notify-step routing (disc forward #68 + //directmsg #69) -----------------
+//
+// The single decision the poll loop makes for an already-addressed doorbell:
+// forward it to the grunt, or notify/deliver it to the local agent? Precedence
+// is `directmsg > forward > fanout`:
+//
+//   1. //directmsg addressed to the local agent  → "notify"  (the #69 override:
+//      a red-phone must-see is NEVER forwarded away — this is what makes forward
+//      safe). Checked FIRST so a forward rule can't swallow it.
+//   2. an active forward rule that matches         → "forward" (the #68 path,
+//      shouldForward unchanged: exclude gate + loop guard).
+//   3. otherwise                                   → "notify"  (default fanout).
+//
+// With `rule === null` it short-circuits to "notify" without inspecting the
+// message, so the no-forward-rule case is byte-for-byte the pre-#68 path.
+export type NotifyRoute = "forward" | "notify";
+
+export function decideNotifyRoute(
+  msg: ForwardableMessage,
+  channel: ForwardableChannel,
+  rule: ForwardRule | null,
+  identity: AgentIdentity
+): NotifyRoute {
+  if (!rule) return "notify";
+  // #69 precedence: a local-addressed directmsg overrides the forward rule.
+  if (directMsgOverridesForward(msg.content, identity)) return "notify";
+  // #68 forward decision, unchanged.
+  return shouldForward(msg, channel, rule) ? "forward" : "notify";
 }
 
 // --- Discord API helpers -----------------------------------------------------
@@ -1130,17 +1194,18 @@ async function checkForNewMessages(
         markDelivered(msg.id);
         cycleNewMessages++;
 
-        // --- disc forward (#68) ---------------------------------------------
-        // If a forward rule is active AND this doorbell is not excluded (and is
-        // not a loop/echo), reroute it to the target: fetch the FULL content and
-        // deliver it via the deliver-router INSTEAD of notifying the local agent.
-        // Excluded traffic (the local agent's allowlist), a loop echo, or NO
-        // forward rule at all falls through to the unchanged notify path below —
-        // the no-rule path is byte-for-byte today's behavior.
-        if (cachedForwardRule && shouldForward(msg, channel, cachedForwardRule)) {
+        // --- notify-step routing (disc forward #68 + //directmsg #69) -------
+        // Precedence: directmsg > forward > fanout (see decideNotifyRoute). A
+        // //directmsg addressed to the local agent overrides an active forward
+        // rule and falls through to the local notify path below — the red-phone
+        // that makes forward safe (it is NEVER forwarded away). Otherwise the
+        // #68 forward decision is unchanged: an active rule reroutes a matching
+        // doorbell to the target; an excluded / loop / no-rule case notifies
+        // locally. With NO forward rule this is byte-for-byte today's behavior.
+        if (decideNotifyRoute(msg, channel, cachedForwardRule, cachedIdentity) === "forward") {
           // Never throws — a failed fetch/delivery is logged and swallowed so
           // the poll loop can never crash on a forward (fire-and-forget).
-          await forwardMessage(cachedForwardRule, channel, msg, authHeader, {
+          await forwardMessage(cachedForwardRule!, channel, msg, authHeader, {
             fetchMessage: fetchMessageById,
             log,
           });
