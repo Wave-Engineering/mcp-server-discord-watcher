@@ -29,6 +29,7 @@ import {
   nextChannelJitterMs,
   refreshChannelList,
   refreshIdentity,
+  fetchMessageById,
   DISCORD_API_BASE,
 } from "../index";
 import type { AgentIdentity } from "../index";
@@ -1710,5 +1711,63 @@ describe("refreshIdentity startup self-registration (#38)", () => {
     // refreshIdentity() must appear inside main() and before the first setInterval
     expect(refreshCallIndex).toBeGreaterThan(mainFnIndex);
     expect(refreshCallIndex).toBeLessThan(pollTimerIndex);
+  });
+});
+
+// --- fetchMessageById: single-message (channel, msgid) fetch (#66) -----------
+
+describe("fetchMessageById", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("GETs /channels/{c}/messages/{m} and returns the message", async () => {
+    let capturedUrl = "";
+    const single: DiscordMessage = {
+      id: "999",
+      author: { id: "u9", username: "dana" },
+      content: "the specific message",
+      timestamp: "2024-01-01T12:05:00.000Z",
+    };
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      capturedUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      return new Response(JSON.stringify(single), { status: 200 });
+    }) as any;
+
+    const msg = await fetchMessageById("123", "999", "Bot test-token");
+
+    // Single-message endpoint — no ?limit / ?after query
+    expect(capturedUrl).toContain("/channels/123/messages/999");
+    expect(capturedUrl).not.toContain("?");
+    expect(msg).not.toBeNull();
+    expect(msg?.id).toBe("999");
+    expect(msg?.content).toBe("the specific message");
+  });
+
+  test("passes the Authorization header through apiGet", async () => {
+    let capturedAuth: string | null | undefined;
+    globalThis.fetch = mock(async (_input: string | URL | Request, init?: RequestInit) => {
+      capturedAuth = new Headers(init?.headers).get("Authorization");
+      return new Response(JSON.stringify({ id: "1", author: { id: "u", username: "x" }, content: "y", timestamp: "t" }), { status: 200 });
+    }) as any;
+
+    await fetchMessageById("123", "1", "Bot secret-token");
+    expect(capturedAuth).toBe("Bot secret-token");
+  });
+
+  test("returns null on 404 (deleted / unknown message)", async () => {
+    globalThis.fetch = mock(async () => new Response("Unknown Message", { status: 404 })) as any;
+    expect(await fetchMessageById("123", "404404404", "Bot t")).toBeNull();
+  });
+
+  test("returns null on 403 (missing READ_MESSAGE_HISTORY)", async () => {
+    globalThis.fetch = mock(async () => new Response("Missing Access", { status: 403 })) as any;
+    expect(await fetchMessageById("123", "1", "Bot t")).toBeNull();
   });
 });
