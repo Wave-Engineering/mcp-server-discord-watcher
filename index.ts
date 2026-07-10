@@ -855,6 +855,37 @@ async function fetchAllNewMessages(
 }
 
 /**
+ * Fetch a single message by (channel, messageId) — GET
+ * /channels/{channelId}/messages/{messageId}.
+ *
+ * The (channel, msgid) single-fetch primitive #66 adds to the watcher. `disc
+ * forward` (#68) is a watcher feature: the forwarder runs inline in the notify
+ * path, so when a forward rule matches it must fetch the FULL message content
+ * here — the watcher already owns `apiGet` + `authHeader` and has NO IPC link to
+ * disc-server to borrow one (the two components coordinate only via files). The
+ * peer disc-server exposes the same primitive to agents as `disc_read`'s
+ * `message_id` param; this is the in-process counterpart for the forwarder.
+ *
+ * Returns the message, or `null` on any non-OK response (404 deleted-parent, 403,
+ * 401, 429, …) — the caller treats that as "nothing to forward". Deliberately
+ * NOT wired into any forward/notify path yet (that is #68); this is prep only.
+ */
+export async function fetchMessageById(
+  channelId: string,
+  messageId: string,
+  authHeader: string
+): Promise<DiscordMessage | null> {
+  const result = await apiGet(
+    `/channels/${channelId}/messages/${messageId}`,
+    authHeader
+  );
+  if (!result.ok) {
+    return null;
+  }
+  return result.data as DiscordMessage;
+}
+
+/**
  * Refresh the watched channel list. Honors both circuit breakers — when the
  * watcher is in 429 cooldown OR has hit a permanent 401 auth failure, this
  * is a no-op so the refresh timer doesn't independently re-burst the API
