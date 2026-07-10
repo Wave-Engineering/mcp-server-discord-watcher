@@ -230,6 +230,19 @@ export function shouldForward(
   return true;
 }
 
+/**
+ * The outcome of a single-message fetch, discriminated so a caller can tell a
+ * genuinely-deleted message (`gone` = HTTP 404 — nothing to forward) from a
+ * transient failure (`error` = network / timeout / rate-limit / 5xx / 403 — the
+ * message likely still exists and must NOT be silently lost). `M` defaults to
+ * the minimal structural view the forwarder needs; index.ts specializes it to
+ * the full `DiscordMessage`.
+ */
+export type FetchMessageResult<M = { content: string }> =
+  | { kind: "found"; message: M }
+  | { kind: "gone" }
+  | { kind: "error" };
+
 /** Injectable deps for {@link forwardMessage} (keeps it unit-testable). */
 export interface ForwardMessageDeps {
   /** Fetch the full message content (index.ts passes fetchMessageById). */
@@ -237,17 +250,36 @@ export interface ForwardMessageDeps {
     channelId: string,
     messageId: string,
     authHeader: string
-  ) => Promise<{ content: string } | null>;
+  ) => Promise<FetchMessageResult>;
   /** The deliver-router (defaults to the real `deliver`). */
   deliverFn?: typeof deliver;
   /** Optional logger. */
   log?: ForwardLogger;
 }
 
-/** Outcome of a forward attempt (never throws — poll-loop safe). */
+/**
+ * Outcome of a forward attempt (never throws — poll-loop safe). The three
+ * non-delivered reasons mirror the fetch discrimination:
+ *   - `gone`        — real 404, the message was deleted; drop it.
+ *   - `fetch_error` — transient fetch failure; the caller MUST fall back to the
+ *                     local notify (see {@link shouldFallbackToLocalNotify}) so
+ *                     the addressed message still reaches the local agent.
+ *   - `exception`   — an unexpected throw on the delivery side; dropped (logged).
+ */
 export type ForwardOutcome =
   | { forwarded: true; result: DeliveryResult }
-  | { forwarded: false; reason: "fetch_null" | "exception" };
+  | { forwarded: false; reason: "gone" | "fetch_error" | "exception" };
+
+/**
+ * After a forward attempt, should the caller fall back to the LOCAL notify path
+ * (`server.notification`, the same path a non-forwarded addressed message takes)
+ * so the message still reaches the local agent? True ONLY for a transient fetch
+ * error — a real 404 (`gone`) is dropped (nothing to forward), a successful
+ * delivery already reached the target, and an `exception` is dropped (logged).
+ */
+export function shouldFallbackToLocalNotify(outcome: ForwardOutcome): boolean {
+  return outcome.forwarded === false && outcome.reason === "fetch_error";
+}
 
 /**
  * Fetch the full message content and deliver it to the target via the
@@ -264,12 +296,21 @@ export async function forwardMessage(
   deps: ForwardMessageDeps
 ): Promise<ForwardOutcome> {
   try {
-    const full = await deps.fetchMessage(channel.id, msg.id, authHeader);
-    if (!full) {
-      // Deleted / 403 / transient — "nothing to forward" (#66 semantics).
-      deps.log?.warn("forward", { to: label(rule), msg: msg.id, skip: "fetch_null" });
-      return { forwarded: false, reason: "fetch_null" };
+    const fetched = await deps.fetchMessage(channel.id, msg.id, authHeader);
+    if (fetched.kind === "gone") {
+      // Real 404 — the message was deleted. Nothing to forward; drop it.
+      deps.log?.warn("forward", { to: label(rule), msg: msg.id, skip: "gone" });
+      return { forwarded: false, reason: "gone" };
     }
+    if (fetched.kind === "error") {
+      // Transient fetch failure (network / timeout / rate-limit / 5xx / 403).
+      // The addressed message likely still exists — do NOT drop it. Signal the
+      // caller (via ForwardOutcome) to fall back to the LOCAL notify so it
+      // still reaches the local agent instead of vanishing.
+      deps.log?.warn("forward", { to: label(rule), msg: msg.id, fallback: "local_notify" });
+      return { forwarded: false, reason: "fetch_error" };
+    }
+    const full = fetched.message;
     const payload = `${forwardHeader(msg.author.username, channel.name)}\n${full.content}`;
     const deliverFn = deps.deliverFn ?? deliver;
     const result = await deliverFn(rule.target, payload, {

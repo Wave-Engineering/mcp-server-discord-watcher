@@ -1727,7 +1727,7 @@ describe("fetchMessageById", () => {
     globalThis.fetch = originalFetch;
   });
 
-  test("GETs /channels/{c}/messages/{m} and returns the message", async () => {
+  test("GETs /channels/{c}/messages/{m} and returns kind:'found' with the message", async () => {
     let capturedUrl = "";
     const single: DiscordMessage = {
       id: "999",
@@ -1740,14 +1740,16 @@ describe("fetchMessageById", () => {
       return new Response(JSON.stringify(single), { status: 200 });
     }) as any;
 
-    const msg = await fetchMessageById("123", "999", "Bot test-token");
+    const res = await fetchMessageById("123", "999", "Bot test-token");
 
     // Single-message endpoint — no ?limit / ?after query
     expect(capturedUrl).toContain("/channels/123/messages/999");
     expect(capturedUrl).not.toContain("?");
-    expect(msg).not.toBeNull();
-    expect(msg?.id).toBe("999");
-    expect(msg?.content).toBe("the specific message");
+    expect(res.kind).toBe("found");
+    if (res.kind === "found") {
+      expect(res.message.id).toBe("999");
+      expect(res.message.content).toBe("the specific message");
+    }
   });
 
   test("passes the Authorization header through apiGet", async () => {
@@ -1761,13 +1763,25 @@ describe("fetchMessageById", () => {
     expect(capturedAuth).toBe("Bot secret-token");
   });
 
-  test("returns null on 404 (deleted / unknown message)", async () => {
+  test("returns kind:'gone' on 404 (deleted / unknown message)", async () => {
     globalThis.fetch = mock(async () => new Response("Unknown Message", { status: 404 })) as any;
-    expect(await fetchMessageById("123", "404404404", "Bot t")).toBeNull();
+    expect(await fetchMessageById("123", "404404404", "Bot t")).toEqual({ kind: "gone" });
   });
 
-  test("returns null on 403 (missing READ_MESSAGE_HISTORY)", async () => {
+  test("returns kind:'error' on 403 (missing READ_MESSAGE_HISTORY — transient)", async () => {
     globalThis.fetch = mock(async () => new Response("Missing Access", { status: 403 })) as any;
-    expect(await fetchMessageById("123", "1", "Bot t")).toBeNull();
+    expect(await fetchMessageById("123", "1", "Bot t")).toEqual({ kind: "error" });
+  });
+
+  test("returns kind:'error' on 5xx (server error — transient)", async () => {
+    globalThis.fetch = mock(async () => new Response("Bad Gateway", { status: 502 })) as any;
+    expect(await fetchMessageById("123", "1", "Bot t")).toEqual({ kind: "error" });
+  });
+
+  test("returns kind:'error' on a network / timeout throw (transient)", async () => {
+    globalThis.fetch = mock(async () => {
+      throw new Error("network down");
+    }) as any;
+    expect(await fetchMessageById("123", "1", "Bot t")).toEqual({ kind: "error" });
   });
 });
