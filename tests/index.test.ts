@@ -9,6 +9,9 @@
  */
 
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { DiscordMessage, DiscordAttachment, DiscordConfig } from "../index";
 import {
   stripTokenPunctuation,
@@ -29,7 +32,6 @@ import {
   nextChannelJitterMs,
   refreshChannelList,
   describeAuthHeader,
-  withProcessAttribution,
   refreshIdentity,
   fetchMessageById,
   DISCORD_API_BASE,
@@ -388,82 +390,71 @@ describe("identity durable-path resolution (#32/#34)", () => {
 
 // --- AgentIdentity interface tests -------------------------------------------
 
-// --- #54: per-process attribution + non-secret auth diagnostics -------------
+// --- #54/#57: non-secret auth diagnostics -----------------------------------
 //
-// 16 watchers share one mcp.jsonl with no process identifier, which made a live
-// 401 incident undiagnosable: failures were provably occurring while a manual
-// probe with the same token succeeded, and nothing could attribute them.
+// The attribution half of #54 was retired in #57 — mcp-logger >= 1.1.0 injects
+// pid + instance natively. These auth diagnostics have NO native equivalent and
+// are the instrument the 401 investigation depends on, so they stay.
 
-describe("withProcessAttribution (#54)", () => {
-  function fakeLogger() {
-    const calls: Array<{ level: string; event: string; fields: Record<string, unknown> }> = [];
-    const base: Record<string, any> = {};
-    for (const level of ["debug", "info", "warn", "error"]) {
-      base[level] = (event: string, fields: Record<string, unknown>) =>
-        calls.push({ level, event, fields });
+// --- #57: the contract that REPLACED the wrapper -----------------------------
+//
+// Retiring withProcessAttribution removed 5 tests and added none, which moved the
+// assertion from "our wrapper does this" to "the pinned dependency does this" —
+// and left the second half unasserted. The acceptance evidence was a one-time
+// manual run, and manual evidence expires the moment it is pasted. These pin the
+// contract in CI instead.
+
+describe("mcp-logger attribution contract (#57)", () => {
+  test("the dependency is pinned EXACTLY — no range", () => {
+    // The realistic regression: someone runs `bun add @wave-engineering/mcp-logger`
+    // and a caret gets written back. 1.1.0's guarantee is a KEY-OWNERSHIP contract
+    // (which field names it reserves), and semver has no opinion on that — a
+    // compliant 1.2.0 reserving another key would silently re-stamp
+    // reserved_conflict on caller fields and destroy the signal #57 restored.
+    const pkg = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", "package.json"), "utf-8")
+    );
+    const spec = pkg.dependencies["@wave-engineering/mcp-logger"];
+    expect(spec).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  test("REAL emitted lines carry pid + instance and NO reserved_conflict", async () => {
+    // Asserts against actual output from the real logger, not a fake — this is
+    // the acceptance criterion from #57 made permanent. A green suite that only
+    // exercised our own code would prove nothing about the dependency.
+    const dir = mkdtempSync(join(tmpdir(), "logcontract-"));
+    const logFile = join(dir, "out.jsonl");
+    const prev = process.env.LOG_FILE;
+    process.env.LOG_FILE = logFile;
+    try {
+      const { createLogger } = await import("@wave-engineering/mcp-logger");
+      const a = createLogger("watcher") as any;
+      const b = createLogger("watcher") as any;
+      a.error("api_call", { status: 401, auth_len: 76, auth_prefix: "Bot " });
+      b.warn("poll", { channel: "general" });
+
+      const lines = readFileSync(logFile, "utf-8")
+        .split("\n")
+        .filter((l) => l.trim().startsWith("{"))
+        .map((l) => JSON.parse(l));
+
+      // Guard against a vacuous pass: zero lines must FAIL, not silently succeed.
+      expect(lines.length).toBeGreaterThan(0);
+      for (const d of lines) {
+        expect(typeof d.pid).toBe("number");
+        expect(typeof d.instance).toBe("string");
+        expect(d.reserved_conflict).toBeUndefined();
+      }
+      // One instance id across separate createLogger() calls — the broader
+      // coverage the wrapper could not provide.
+      expect(new Set(lines.map((d: any) => d.instance)).size).toBe(1);
+      // The 401 instrument survived the wrapper's deletion.
+      expect(lines.find((d: any) => d.status === 401)?.auth_prefix).toBe("Bot ");
+    } finally {
+      if (prev === undefined) delete process.env.LOG_FILE;
+      else process.env.LOG_FILE = prev;
+      rmSync(dir, { recursive: true, force: true });
     }
-    return { base, calls };
-  }
-
-  test("wraps EVERY level — no level silently left unattributed", () => {
-    // The load-bearing property. Correctness rests on mcp-logger returning a
-    // plain object literal of functions — an implementation detail of a package
-    // this repo does NOT own. If it moves to a class with prototype methods,
-    // Object.keys returns fewer keys, attribution vanishes from some levels,
-    // and nothing else in the suite would notice.
-    const { base, calls } = fakeLogger();
-    const wrapped = withProcessAttribution(base as any) as any;
-    expect(Object.keys(wrapped).sort()).toEqual(Object.keys(base).sort());
-    for (const level of Object.keys(wrapped)) wrapped[level]("evt", {});
-    expect(calls).toHaveLength(4);
-    for (const c of calls) {
-      expect(c.fields.pid).toBe(process.pid);
-      expect(typeof c.fields.instance).toBe("string");
-      expect((c.fields.instance as string).length).toBeGreaterThan(0);
-    }
-  });
-
-  test("preserves caller fields alongside the injected ones", () => {
-    const { base, calls } = fakeLogger();
-    const wrapped = withProcessAttribution(base as any) as any;
-    wrapped.warn("api_call", { status: 401, endpoint: "/x" });
-    expect(calls[0].fields).toMatchObject({
-      status: 401,
-      endpoint: "/x",
-      pid: process.pid,
-    });
-  });
-
-  test("does not throw when a level is called with no fields", () => {
-    // Our LogFn type declares `fields` required; mcp-logger's Logger declares it
-    // OPTIONAL. The casts paper over that divergence, so only a runtime test
-    // pins it. `{...undefined}` is legal JS — this asserts it stays that way.
-    const { base, calls } = fakeLogger();
-    const wrapped = withProcessAttribution(base as any) as any;
-    expect(() => wrapped.info("evt")).not.toThrow();
-    expect(calls[0].fields.pid).toBe(process.pid);
-  });
-
-  test("passes non-function properties through untouched", () => {
-    // Guards a future mcp-logger exposing a config field: blindly wrapping it
-    // would replace it with a closure that throws when read as data.
-    const base: Record<string, any> = {
-      info: (_e: string, _f: Record<string, unknown>) => {},
-      level: "debug",
-      config: { a: 1 },
-    };
-    const wrapped = withProcessAttribution(base as any) as any;
-    expect(wrapped.level).toBe("debug");
-    expect(wrapped.config).toEqual({ a: 1 });
-    expect(typeof wrapped.info).toBe("function");
-  });
-
-  test("the instance id is stable within a process", () => {
-    const { base, calls } = fakeLogger();
-    const wrapped = withProcessAttribution(base as any) as any;
-    wrapped.info("a", {});
-    wrapped.error("b", {});
-    expect(calls[0].fields.instance).toBe(calls[1].fields.instance);
   });
 });
 
