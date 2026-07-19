@@ -28,6 +28,8 @@ import {
   isReplyToOurSignature,
   nextChannelJitterMs,
   refreshChannelList,
+  describeAuthHeader,
+  withProcessAttribution,
   refreshIdentity,
   fetchMessageById,
   DISCORD_API_BASE,
@@ -385,6 +387,129 @@ describe("identity durable-path resolution (#32/#34)", () => {
 });
 
 // --- AgentIdentity interface tests -------------------------------------------
+
+// --- #54: per-process attribution + non-secret auth diagnostics -------------
+//
+// 16 watchers share one mcp.jsonl with no process identifier, which made a live
+// 401 incident undiagnosable: failures were provably occurring while a manual
+// probe with the same token succeeded, and nothing could attribute them.
+
+describe("withProcessAttribution (#54)", () => {
+  function fakeLogger() {
+    const calls: Array<{ level: string; event: string; fields: Record<string, unknown> }> = [];
+    const base: Record<string, any> = {};
+    for (const level of ["debug", "info", "warn", "error"]) {
+      base[level] = (event: string, fields: Record<string, unknown>) =>
+        calls.push({ level, event, fields });
+    }
+    return { base, calls };
+  }
+
+  test("wraps EVERY level — no level silently left unattributed", () => {
+    // The load-bearing property. Correctness rests on mcp-logger returning a
+    // plain object literal of functions — an implementation detail of a package
+    // this repo does NOT own. If it moves to a class with prototype methods,
+    // Object.keys returns fewer keys, attribution vanishes from some levels,
+    // and nothing else in the suite would notice.
+    const { base, calls } = fakeLogger();
+    const wrapped = withProcessAttribution(base as any) as any;
+    expect(Object.keys(wrapped).sort()).toEqual(Object.keys(base).sort());
+    for (const level of Object.keys(wrapped)) wrapped[level]("evt", {});
+    expect(calls).toHaveLength(4);
+    for (const c of calls) {
+      expect(c.fields.pid).toBe(process.pid);
+      expect(typeof c.fields.instance).toBe("string");
+      expect((c.fields.instance as string).length).toBeGreaterThan(0);
+    }
+  });
+
+  test("preserves caller fields alongside the injected ones", () => {
+    const { base, calls } = fakeLogger();
+    const wrapped = withProcessAttribution(base as any) as any;
+    wrapped.warn("api_call", { status: 401, endpoint: "/x" });
+    expect(calls[0].fields).toMatchObject({
+      status: 401,
+      endpoint: "/x",
+      pid: process.pid,
+    });
+  });
+
+  test("does not throw when a level is called with no fields", () => {
+    // Our LogFn type declares `fields` required; mcp-logger's Logger declares it
+    // OPTIONAL. The casts paper over that divergence, so only a runtime test
+    // pins it. `{...undefined}` is legal JS — this asserts it stays that way.
+    const { base, calls } = fakeLogger();
+    const wrapped = withProcessAttribution(base as any) as any;
+    expect(() => wrapped.info("evt")).not.toThrow();
+    expect(calls[0].fields.pid).toBe(process.pid);
+  });
+
+  test("passes non-function properties through untouched", () => {
+    // Guards a future mcp-logger exposing a config field: blindly wrapping it
+    // would replace it with a closure that throws when read as data.
+    const base: Record<string, any> = {
+      info: (_e: string, _f: Record<string, unknown>) => {},
+      level: "debug",
+      config: { a: 1 },
+    };
+    const wrapped = withProcessAttribution(base as any) as any;
+    expect(wrapped.level).toBe("debug");
+    expect(wrapped.config).toEqual({ a: 1 });
+    expect(typeof wrapped.info).toBe("function");
+  });
+
+  test("the instance id is stable within a process", () => {
+    const { base, calls } = fakeLogger();
+    const wrapped = withProcessAttribution(base as any) as any;
+    wrapped.info("a", {});
+    wrapped.error("b", {});
+    expect(calls[0].fields.instance).toBe(calls[1].fields.instance);
+  });
+});
+
+describe("describeAuthHeader (#54)", () => {
+  // Deliberately NOT shaped like a real Discord token (no base64.ts.hmac
+  // segments). A realistic-looking fake trips GitHub push protection and,
+  // worse, invites a future reader to wonder whether it is live. Nothing
+  // here depends on the shape — only on length and the scheme prefix.
+  const TOKEN = "FAKE-TEST-CREDENTIAL-NOT-A-REAL-TOKEN-000000000000";
+  const HEADER = `Bot ${TOKEN}`;
+
+  test("reports the length and the scheme prefix", () => {
+    const d = describeAuthHeader(HEADER);
+    expect(d.auth_len).toBe(HEADER.length);
+    expect(d.auth_prefix).toBe("Bot ");
+  });
+
+  test("SECRET SAFETY: emits no part of the token beyond the scheme prefix", () => {
+    // Load-bearing. A regression here leaks a credential into a log file that
+    // is not treated as a secret store. Serialize exactly as the logger would
+    // and assert the token cannot be recovered from it.
+    const serialized = JSON.stringify(describeAuthHeader(HEADER));
+    expect(serialized).not.toContain(TOKEN);
+    // no run of token characters, not merely the whole token
+    for (let n = 6; n <= 24; n += 6) {
+      expect(serialized).not.toContain(TOKEN.slice(0, n));
+    }
+    // Pin the prefix EXACTLY. The loop above starts at n=6, so widening the
+    // slice to 5–9 chars would leak 1–5 token characters undetected; this
+    // closes that blind spot without hard-coding token bytes into the test.
+    expect(describeAuthHeader(HEADER).auth_prefix).toBe(HEADER.slice(0, 4));
+  });
+
+  test("a malformed header is still describable (does not throw)", () => {
+    expect(describeAuthHeader("")).toEqual({ auth_len: 0, auth_prefix: "" });
+    expect(describeAuthHeader(TOKEN).auth_prefix).not.toBe("Bot ");
+  });
+
+  test("discriminates a bare token from a correctly-prefixed one", () => {
+    // This is the whole diagnostic purpose: a process sending a bare token
+    // (the known 401 cause) is distinguishable from one sending "Bot <tok>".
+    expect(describeAuthHeader(TOKEN).auth_prefix).not.toBe("Bot ");
+    expect(describeAuthHeader(HEADER).auth_prefix).toBe("Bot ");
+    expect(describeAuthHeader(HEADER).auth_len - describeAuthHeader(TOKEN).auth_len).toBe(4);
+  });
+});
 
 describe("AgentIdentity interface", () => {
   test("has devName and devTeam fields", async () => {
