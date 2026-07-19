@@ -258,27 +258,47 @@ export interface ForwardMessageDeps {
 }
 
 /**
- * Outcome of a forward attempt (never throws — poll-loop safe). The three
+ * Outcome of a forward attempt (never throws — poll-loop safe). The four
  * non-delivered reasons mirror the fetch discrimination:
- *   - `gone`        — real 404, the message was deleted; drop it.
- *   - `fetch_error` — transient fetch failure; the caller MUST fall back to the
- *                     local notify (see {@link shouldFallbackToLocalNotify}) so
- *                     the addressed message still reaches the local agent.
- *   - `exception`   — an unexpected throw on the delivery side; dropped (logged).
+ *   - `gone`          — real 404, the message was deleted; drop it.
+ *   - `fetch_error`   — transient fetch failure; the caller MUST fall back to the
+ *                       local notify (see {@link shouldFallbackToLocalNotify}) so
+ *                       the addressed message still reaches the local agent.
+ *   - `deliver_error` — the deliver-router reported `ok: false` (transport send
+ *                       failed, or no transport was available). The message
+ *                       provably did NOT reach the target, so — exactly as with
+ *                       `fetch_error` — the caller MUST fall back to the local
+ *                       notify rather than lose it.
+ *   - `exception`     — an unexpected throw on the delivery side; dropped (logged).
  */
 export type ForwardOutcome =
   | { forwarded: true; result: DeliveryResult }
-  | { forwarded: false; reason: "gone" | "fetch_error" | "exception" };
+  | {
+      forwarded: false;
+      reason: "gone" | "fetch_error" | "deliver_error" | "exception";
+      result?: DeliveryResult;
+    };
 
 /**
  * After a forward attempt, should the caller fall back to the LOCAL notify path
  * (`server.notification`, the same path a non-forwarded addressed message takes)
- * so the message still reaches the local agent? True ONLY for a transient fetch
- * error — a real 404 (`gone`) is dropped (nothing to forward), a successful
- * delivery already reached the target, and an `exception` is dropped (logged).
+ * so the message still reaches the local agent?
+ *
+ * True whenever the message provably did NOT reach the target but still exists:
+ * a transient fetch error, or a failed delivery. A real 404 (`gone`) is dropped
+ * (nothing left to forward), a SUCCESSFUL delivery already reached the target
+ * (waking the local agent too would defeat the point of forwarding), and an
+ * `exception` is dropped (logged) — its delivery state is unknown, so it is
+ * treated as possibly-delivered rather than risking a spurious local wake.
+ *
+ * Note this is NOT transport fallthrough/retry: the frozen "selection, not
+ * retry" decision of epic #65 is untouched. The router still picks one
+ * transport and never escalates. This only ensures a message the router could
+ * not deliver still reaches the local agent instead of vanishing.
  */
 export function shouldFallbackToLocalNotify(outcome: ForwardOutcome): boolean {
-  return outcome.forwarded === false && outcome.reason === "fetch_error";
+  if (outcome.forwarded !== false) return false;
+  return outcome.reason === "fetch_error" || outcome.reason === "deliver_error";
 }
 
 /**
@@ -323,7 +343,15 @@ export async function forwardMessage(
       ok: result.ok,
       id: msg.id,
       ...(result.error ? { error: result.error } : {}),
+      ...(result.ok ? {} : { fallback: "local_notify" }),
     });
+    if (!result.ok) {
+      // The router could not deliver (transport send threw, or nothing was
+      // available). The message provably did NOT reach the target — do NOT
+      // report it as forwarded, or the caller skips the local notify and the
+      // addressed message is lost to both the target and the local agent.
+      return { forwarded: false, reason: "deliver_error", result };
+    }
     return { forwarded: true, result };
   } catch (err) {
     deps.log?.error("forward", { to: label(rule), msg: msg.id }, String(err));

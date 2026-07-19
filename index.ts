@@ -1223,11 +1223,12 @@ async function checkForNewMessages(
             fetchMessage: fetchMessageById,
             log,
           });
-          // Delivered, or dropped as a real 404 (gone) / unexpected exception →
-          // do NOT notify the local agent. A TRANSIENT fetch error (#44) is the
-          // one case that falls through: the addressed message likely still
-          // exists, so we reach the local notify path below — the same path a
-          // non-forwarded addressed message takes — rather than lose it.
+          // Successfully delivered, or dropped as a real 404 (gone) / unexpected
+          // exception → do NOT notify the local agent. Two cases fall through to
+          // the local notify path below — the same path a non-forwarded
+          // addressed message takes — rather than lose the message: a TRANSIENT
+          // fetch error (#44), and a FAILED delivery (#46, router reported
+          // ok:false). In both the message provably did not reach the target.
           if (!shouldFallbackToLocalNotify(outcome)) {
             continue;
           }
