@@ -295,8 +295,47 @@ describe("forwardMessage", () => {
       fetchMessage: async () => ({ kind: "found", message: { content: "body" } }),
       deliverFn: (async () => ({ ok: false, transport: "aoe", id: "m", error: "aoe send exited 1" })) as any,
     });
+    // NOT `forwarded: true` — the router reported ok:false, so the message never
+    // reached the target (#46). Reporting it as forwarded made the caller skip
+    // the local notify and the message was lost to target AND local agent.
+    expect(out.forwarded).toBe(false);
+    if (!out.forwarded) {
+      expect(out.reason).toBe("deliver_error");
+      expect(out.result?.error).toBe("aoe send exited 1");
+    }
+  });
+
+  test("delivery failure → falls back to local notify (message not lost, #46)", async () => {
+    const out = await forwardMessage(rule(), CH, makeMsg(), "Bot t", {
+      fetchMessage: async () => ({ kind: "found", message: { content: "body" } }),
+      deliverFn: (async () => ({ ok: false, transport: "aoe", id: "m", error: "aoe send exited 1" })) as any,
+    });
+    expect(shouldFallbackToLocalNotify(out)).toBe(true);
+  });
+
+  test("no available transport → deliver_error, falls back to local notify", async () => {
+    const out = await forwardMessage(rule(), CH, makeMsg(), "Bot t", {
+      fetchMessage: async () => ({ kind: "found", message: { content: "body" } }),
+      deliverFn: (async () => ({
+        ok: false,
+        transport: "none",
+        id: "m",
+        error: "no available transport",
+      })) as any,
+    });
+    expect(out.forwarded).toBe(false);
+    if (!out.forwarded) expect(out.reason).toBe("deliver_error");
+    expect(shouldFallbackToLocalNotify(out)).toBe(true);
+  });
+
+  test("a SUCCESSFUL delivery still suppresses local notify (no double-delivery)", async () => {
+    const { fn } = fakeDeliver();
+    const out = await forwardMessage(rule(), CH, makeMsg(), "Bot t", {
+      fetchMessage: async () => ({ kind: "found", message: { content: "body" } }),
+      deliverFn: fn as any,
+    });
     expect(out.forwarded).toBe(true);
-    if (out.forwarded) expect(out.result.ok).toBe(false);
+    expect(shouldFallbackToLocalNotify(out)).toBe(false);
   });
 
   test("an exception in fetch/deliver is swallowed (never crashes the loop)", async () => {
@@ -314,6 +353,11 @@ describe("forwardMessage", () => {
 describe("shouldFallbackToLocalNotify", () => {
   test("transient fetch error → fall back to local notify", () => {
     const out: ForwardOutcome = { forwarded: false, reason: "fetch_error" };
+    expect(shouldFallbackToLocalNotify(out)).toBe(true);
+  });
+
+  test("failed delivery → fall back to local notify (#46)", () => {
+    const out: ForwardOutcome = { forwarded: false, reason: "deliver_error" };
     expect(shouldFallbackToLocalNotify(out)).toBe(true);
   });
 
