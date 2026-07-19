@@ -32,6 +32,7 @@ import {
   nextChannelJitterMs,
   refreshChannelList,
   describeAuthHeader,
+  classifyFetchFailure,
   refreshIdentity,
   fetchMessageById,
   DISCORD_API_BASE,
@@ -499,6 +500,82 @@ describe("describeAuthHeader (#54)", () => {
     expect(describeAuthHeader(TOKEN).auth_prefix).not.toBe("Bot ");
     expect(describeAuthHeader(HEADER).auth_prefix).toBe("Bot ");
     expect(describeAuthHeader(HEADER).auth_len - describeAuthHeader(TOKEN).auth_len).toBe(4);
+  });
+});
+
+// --- #48: proxy 404 must not be misread as a deleted message ----------------
+//
+// Confirmed firing in PRODUCTION for 43+ hours: the deployed scream-hole v1.2.0
+// does not route GET /channels/{id}/messages/{id}, so every fetchMessageById
+// through it hit the catch-all 404 and was classified `gone` → dropped, no
+// fallback, no log. The status code alone cannot say WHO answered.
+
+describe("classifyFetchFailure (#48)", () => {
+  test("Discord 404 with a RESOURCE-GONE code → gone (genuine deletion still drops)", () => {
+    expect(classifyFetchFailure(404, { message: "Unknown Message", code: 10008 })).toBe("gone");
+    expect(classifyFetchFailure(404, { message: "Unknown Channel", code: 10003 })).toBe("gone");
+  });
+
+  test("THE PRODUCTION BUG: scream-hole catch-all 404 → error, NOT gone", () => {
+    // Body captured from the live proxy by babelfish:
+    //   GET https://scream-hole.apps.oakai.waveeng.com/api/v10/channels/1/messages/1
+    //   → 404 {"error":"not found"}
+    expect(classifyFetchFailure(404, { error: "not found" })).toBe("error");
+  });
+
+  test("a self-identifying proxy body → error, however Discord-like otherwise", () => {
+    // Presence-based identification: even if a proxy body grows a `code` field,
+    // announcing itself as an intermediary wins. Discrimination by ABSENCE of
+    // `code` would silently flip here; this must not.
+    expect(classifyFetchFailure(404, { error: "no route", proxy: "scream-hole" })).toBe("error");
+    expect(classifyFetchFailure(404, { code: 10008, proxy: "scream-hole" })).toBe("error");
+  });
+
+  test("Discord's GENERIC 404 (code:0) → error, NOT gone", () => {
+    // Verified against the live API: an unrouted/malformed path returns
+    //   404 {"message":"404: Not Found","code":0}
+    // `typeof 0 === "number"`, so an "any numeric code" rule classified this as
+    // a deletion — #48's exact shape with Discord as the speaker. A malformed
+    // message id or a route regression would silently drop messages.
+    expect(classifyFetchFailure(404, { message: "404: Not Found", code: 0 })).toBe("error");
+  });
+
+  test("a generic gateway envelope using the STATUS as the code → error", () => {
+    // {"code":404,"message":"Not Found"} is a common intermediary shape.
+    expect(classifyFetchFailure(404, { code: 404, message: "Not Found" })).toBe("error");
+  });
+
+  test("a real Discord code that is not a resource-gone code → error", () => {
+    // 50001 Missing Access is a permissions problem, not a deletion — the
+    // message likely still exists, so it must not be dropped.
+    expect(classifyFetchFailure(404, { message: "Missing Access", code: 50001 })).toBe("error");
+  });
+
+  test("unidentified speaker → error (the DEFAULT branch, fail toward keeping)", () => {
+    for (const body of [undefined, null, "", 0, [], {}, { raw: "<html>502</html>" }, { error: "x" }]) {
+      expect(classifyFetchFailure(404, body)).toBe("error");
+    }
+  });
+
+  test("survives a proxy catch-all status change (404 → 501)", () => {
+    // scream-hole may switch its catch-all to 501. Nothing here keys on the
+    // proxy's number, so the classifier is correct before and after.
+    expect(classifyFetchFailure(501, { error: "no route", proxy: "scream-hole" })).toBe("error");
+    expect(classifyFetchFailure(501, { code: 10008 })).toBe("error");
+  });
+
+  test("non-404 statuses are always error, code or not", () => {
+    for (const st of [401, 403, 429, 500, 502, 503]) {
+      expect(classifyFetchFailure(st, { code: 10008 })).toBe("error");
+      expect(classifyFetchFailure(st, { error: "not found" })).toBe("error");
+    }
+  });
+
+  test("a code that is not a number does not qualify as Discord", () => {
+    // Guards a string-typed `code` (the wrong-type-config defect class) from
+    // being read as an authoritative Discord deletion.
+    expect(classifyFetchFailure(404, { code: "10008" })).toBe("error");
+    expect(classifyFetchFailure(404, { code: null })).toBe("error");
   });
 });
 
@@ -1879,9 +1956,42 @@ describe("fetchMessageById", () => {
     expect(capturedAuth).toBe("Bot secret-token");
   });
 
-  test("returns kind:'gone' on 404 (deleted / unknown message)", async () => {
-    globalThis.fetch = mock(async () => new Response("Unknown Message", { status: 404 })) as any;
+  test("returns kind:'gone' on a real Discord 404 (deleted / unknown message)", async () => {
+    // FIXTURE CORRECTED (#48). This previously mocked a bare text body
+    // (`new Response("Unknown Message", {status: 404})`), which Discord never
+    // sends — its error envelope is JSON carrying a numeric `code`. That
+    // unrealistic fixture is part of why a status-only check looked sufficient:
+    // with no distinguishing body in the test, there was nothing to discriminate
+    // ON, so `status === 404` looked like the only available signal.
+    globalThis.fetch = mock(
+      async () =>
+        new Response(JSON.stringify({ message: "Unknown Message", code: 10008 }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        })
+    ) as any;
     expect(await fetchMessageById("123", "404404404", "Bot t")).toEqual({ kind: "gone" });
+  });
+
+  test("returns kind:'error' on a 404 whose body does NOT identify Discord (#48)", async () => {
+    // The production bug, end to end through the real fetchMessageById: the
+    // deployed scream-hole catch-all. Must NOT be classified `gone`.
+    globalThis.fetch = mock(
+      async () =>
+        new Response(JSON.stringify({ error: "not found" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        })
+    ) as any;
+    expect(await fetchMessageById("123", "1", "Bot t")).toEqual({ kind: "error" });
+  });
+
+  test("returns kind:'error' on a bare-text 404 (unidentified speaker)", async () => {
+    // Deliberate behaviour change: a 404 with no parseable identifying envelope
+    // is now kept, not dropped. Failing toward keeping costs one spurious local
+    // notify; failing the other way loses the message silently forever.
+    globalThis.fetch = mock(async () => new Response("Unknown Message", { status: 404 })) as any;
+    expect(await fetchMessageById("123", "1", "Bot t")).toEqual({ kind: "error" });
   });
 
   test("returns kind:'error' on 403 (missing READ_MESSAGE_HISTORY — transient)", async () => {

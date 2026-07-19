@@ -268,7 +268,7 @@ describe("forwardMessage", () => {
     expect(calls[0].opts?.id).toBe("m-42"); // idempotency = Discord message id
   });
 
-  test("gone (real 404) → dropped, deliver never called, no local fallback", async () => {
+  test("gone (identified deletion) → dropped, deliver never called, no local fallback", async () => {
     const { fn, calls } = fakeDeliver();
     const out = await forwardMessage(rule(), CH, makeMsg(), "Bot t", {
       fetchMessage: async () => ({ kind: "gone" }),
@@ -361,7 +361,7 @@ describe("shouldFallbackToLocalNotify", () => {
     expect(shouldFallbackToLocalNotify(out)).toBe(true);
   });
 
-  test("real 404 (gone) → drop, do NOT notify local", () => {
+  test("identified deletion (gone) → drop, do NOT notify local", () => {
     const out: ForwardOutcome = { forwarded: false, reason: "gone" };
     expect(shouldFallbackToLocalNotify(out)).toBe(false);
   });
