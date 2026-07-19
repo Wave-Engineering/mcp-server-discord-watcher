@@ -232,7 +232,8 @@ export function shouldForward(
 
 /**
  * The outcome of a single-message fetch, discriminated so a caller can tell a
- * genuinely-deleted message (`gone` = HTTP 404 — nothing to forward) from a
+ * genuinely-deleted message (`gone` — positively identified from Discord's own
+ * error envelope, NOT merely HTTP 404, see classifyFetchFailure #48) from a
  * transient failure (`error` = network / timeout / rate-limit / 5xx / 403 — the
  * message likely still exists and must NOT be silently lost). `M` defaults to
  * the minimal structural view the forwarder needs; index.ts specializes it to
@@ -260,7 +261,9 @@ export interface ForwardMessageDeps {
 /**
  * Outcome of a forward attempt (never throws — poll-loop safe). The four
  * non-delivered reasons mirror the fetch discrimination:
- *   - `gone`          — real 404, the message was deleted; drop it.
+ *   - `gone`          — the message was deleted, positively identified from
+ *                       Discord's own error envelope (NOT merely "HTTP 404" —
+ *                       see classifyFetchFailure, #48); drop it.
  *   - `fetch_error`   — transient fetch failure; the caller MUST fall back to the
  *                       local notify (see {@link shouldFallbackToLocalNotify}) so
  *                       the addressed message still reaches the local agent.
@@ -285,7 +288,8 @@ export type ForwardOutcome =
  * so the message still reaches the local agent?
  *
  * True whenever the message provably did NOT reach the target but still exists:
- * a transient fetch error, or a failed delivery. A real 404 (`gone`) is dropped
+ * a transient fetch error, or a failed delivery. A positively-identified
+ * deletion (`gone`) is dropped
  * (nothing left to forward), a SUCCESSFUL delivery already reached the target
  * (waking the local agent too would defeat the point of forwarding), and an
  * `exception` is dropped (logged) — its delivery state is unknown, so it is
@@ -318,7 +322,8 @@ export async function forwardMessage(
   try {
     const fetched = await deps.fetchMessage(channel.id, msg.id, authHeader);
     if (fetched.kind === "gone") {
-      // Real 404 — the message was deleted. Nothing to forward; drop it.
+      // Positively identified as deleted by Discord (not merely a 404 —
+      // an unrouted proxy/origin path also 404s, #48). Nothing to forward.
       deps.log?.warn("forward", { to: label(rule), msg: msg.id, skip: "gone" });
       return { forwarded: false, reason: "gone" };
     }

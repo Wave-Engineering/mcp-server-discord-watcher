@@ -620,10 +620,37 @@ export function describeAuthHeader(
   };
 }
 
+/**
+ * Read and parse an error response body, best-effort. Returns the parsed JSON,
+ * or `undefined` if the body is absent/unreadable/not JSON.
+ *
+ * Needed because a bare status code cannot tell us WHO answered (#48): a 404
+ * from Discord and a 404 from an unrouted path on the scream-hole proxy are the
+ * same number with different meanings, and only the body distinguishes them.
+ * Never throws — a body we can't read simply yields `undefined`, which callers
+ * must treat as "unidentified speaker".
+ */
+async function readErrorBody(res: Response): Promise<unknown> {
+  try {
+    const text = await res.text();
+    if (!text) return undefined;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { raw: text.slice(0, 200) };
+    }
+  } catch {
+    return undefined;
+  }
+}
+
 async function apiGet(
   endpoint: string,
   authHeader: string
-): Promise<{ ok: true; data: unknown } | { ok: false; status: number; retryAfter?: number }> {
+): Promise<
+  | { ok: true; data: unknown }
+  | { ok: false; status: number; retryAfter?: number; body?: unknown }
+> {
   const service = API_BASE === DISCORD_API_BASE ? "discord" : "scream-hole";
   // Strip query params for logging (path only)
   const pathOnly = endpoint.split("?")[0];
@@ -666,7 +693,8 @@ async function apiGet(
   }
   if (!res.ok) {
     log.warn("api_call", { method: "GET", endpoint: pathOnly, status: res.status, ms, service });
-    return { ok: false, status: res.status };
+    // Surface the body so callers can tell WHO answered (#48) — origin vs proxy.
+    return { ok: false, status: res.status, body: await readErrorBody(res) };
   }
   log.debug("api_call", { method: "GET", endpoint: pathOnly, status: res.status, ms, service });
   return { ok: true, data: await res.json() };
@@ -1043,6 +1071,72 @@ async function fetchAllNewMessages(
 }
 
 /**
+ * Discord error codes that mean "this specific resource does not exist".
+ * Module-private: an exported mutable Set could be `.add(0)`-ed by an importer,
+ * silently restoring the very bug this closes.
+ * Deliberately an allowlist, not a range or a truthiness test — see
+ * {@link classifyFetchFailure}. `10008` unknown message, `10003` unknown channel.
+ */
+const DISCORD_RESOURCE_GONE_CODES = new Set([10008, 10003]);
+
+/**
+ * Classify a non-OK fetch as `gone` (the message really was deleted — drop it)
+ * or `error` (transient / unknown — keep it, fall back to a local notify).
+ *
+ * WHY THIS IS NOT `status === 404` (#48). A bare 404 does not say who answered.
+ * When the watcher routes through the scream-hole proxy, an *unrouted path*
+ * returns the proxy's catch-all 404 — indistinguishable by status from Discord
+ * saying "this message was deleted". Treating that as `gone` silently dropped
+ * every forwarded message on a proxied host for 43+ hours in production.
+ *
+ * So we identify the speaker POSITIVELY, never by absence:
+ *
+ *   - Discord says the resource itself is gone, via one of two specific codes:
+ *     `10008` unknown message or `10003` unknown channel → `gone`.
+ *
+ *     It must be those codes and not merely "a numeric `code`". Verified against
+ *     the live API: an unrouted or malformed path returns
+ *     `404 {"message":"404: Not Found","code":0}` — a *generic* 404 that says
+ *     nothing about the message existing. Accepting any number would classify
+ *     that as a deletion and silently drop the message, which is #48's exact
+ *     failure shape with Discord as the speaker instead of the proxy (a
+ *     malformed message id or a route regression would be enough to trigger it).
+ *     `{"code":404,"message":"Not Found"}` — a common gateway envelope — has the
+ *     same problem. An allowlist is the only shape that actually identifies
+ *     "this specific resource is gone" rather than "some JSON API said 404".
+ *   - An intermediary identifies itself (e.g. `{"proxy":"scream-hole"}`) → it is
+ *     not the origin, so it cannot testify that the message was deleted →
+ *     `error`.
+ *   - ANYTHING ELSE — no body, unparseable body, unrecognised shape, a future
+ *     proxy we've never seen — is an unidentified speaker → `error`.
+ *
+ * The third branch is the load-bearing one and is deliberately the DEFAULT:
+ * only a positively-identified origin 404 may ever drop a message. Failing
+ * toward keeping the message costs at most one spurious local notify; failing
+ * the other way loses it silently forever.
+ *
+ * This is also why the check is not keyed on the proxy's status code: scream-hole
+ * may change its catch-all from 404 to 501, and this classifier stays correct
+ * either way because it never relied on the number.
+ */
+export function classifyFetchFailure(
+  status: number,
+  body: unknown
+): "gone" | "error" {
+  if (status !== 404) return "error";
+  if (typeof body !== "object" || body === null) return "error";
+  const b = body as Record<string, unknown>;
+  // An intermediary announcing itself is never authoritative about deletion.
+  if (typeof b.proxy === "string") return "error";
+  // Only Discord's specific resource-gone codes count. NOT "any numeric code" —
+  // Discord's own generic 404 carries `code: 0`.
+  if (typeof b.code === "number" && DISCORD_RESOURCE_GONE_CODES.has(b.code)) {
+    return "gone";
+  }
+  return "error";
+}
+
+/**
  * Fetch a single message by (channel, messageId) — GET
  * /channels/{channelId}/messages/{messageId}.
  *
@@ -1055,7 +1149,8 @@ async function fetchAllNewMessages(
  * `message_id` param; this is the in-process counterpart for the forwarder.
  *
  * Returns a discriminated {@link FetchMessageResult}: `found` with the message,
- * `gone` on a genuine 404 (the message was deleted — nothing to forward), or
+ * `gone` only when the failure is positively identified as Discord saying the
+ * resource is gone (see classifyFetchFailure — NOT merely a 404, #48), or
  * `error` on any other failure (403 / 401 / 429 / 5xx, plus a network / timeout
  * throw). The distinction is load-bearing for the forward path (#44): a `gone`
  * message is dropped, but an `error` is transient and the addressed message must
@@ -1074,11 +1169,7 @@ export async function fetchMessageById(
     if (result.ok) {
       return { kind: "found", message: result.data as DiscordMessage };
     }
-    // 404 = the message (or its parent) was deleted. Every other non-OK status
-    // (403 / 401 / 429 / 5xx) is transient from the forwarder's standpoint —
-    // the message likely still exists and should not be silently dropped.
-    if (result.status === 404) return { kind: "gone" };
-    return { kind: "error" };
+    return { kind: classifyFetchFailure(result.status, result.body) };
   } catch {
     // Network / timeout — the fetch never completed. Transient by definition.
     return { kind: "error" };
@@ -1273,7 +1364,8 @@ async function checkForNewMessages(
             fetchMessage: fetchMessageById,
             log,
           });
-          // Successfully delivered, or dropped as a real 404 (gone) / unexpected
+          // Successfully delivered, or dropped as a positively-identified
+          // deletion (gone) / unexpected
           // exception → do NOT notify the local agent. Two cases fall through to
           // the local notify path below — the same path a non-forwarded
           // addressed message takes — rather than lose the message: a TRANSIENT
