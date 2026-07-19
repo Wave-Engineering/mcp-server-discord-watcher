@@ -222,86 +222,18 @@ export function loadConfig(): {
   return { guildId, tokenPath, screamHoleUrl, channelAllowlist };
 }
 
-// --- Per-process log attribution (#54) ---------------------------------------
-//
-// Up to ~16 watcher processes on one host write to a SINGLE ~/.claude/logs/
-// mcp.jsonl, and the envelope (`{ts, server, level, event, ...fields}`) carries
-// no process identifier — `server` is the literal string "watcher" for all of
-// them. So "which watcher emitted this?" is unanswerable, which is exactly the
-// question a multi-process incident turns on. It blocked the #53 investigation
-// outright: 401s were provably firing on some watchers while a manual probe with
-// the same token succeeded, and there was no way to attribute the failures.
-//
-// Same defect class as #53 itself — shared mutable state across independent
-// processes with no ownership. There the shared thing is a sentinel file; here
-// it is a log stream.
-//
-// `createLogger(name)` takes no static fields, so pid cannot be injected at
-// construction. The envelope does spread caller `...fields`, so we decorate the
-// logger once here rather than touching ~100 call sites. The correct long-term
-// home is `@wave-engineering/mcp-logger` (so every MCP server gets this rather
-// than each re-implementing it) — tracked separately; that package is not owned
-// by this repo.
-
-/**
- * Per-process instance id. A pid alone is not sufficient over a long-lived log:
- * pids are recycled, so a restarted watcher can reuse the id of a dead one and
- * two genuinely different processes become indistinguishable hours apart. This
- * disambiguates them.
- */
-const LOG_INSTANCE_ID = `${process.pid.toString(36)}-${Math.random()
-  .toString(36)
-  .slice(2, 8)}`;
-
-/** The logger surface we decorate (matches mcp-logger's shape). */
-type LogFn = (
-  event: string,
-  fields: Record<string, unknown>,
-  msg?: string
-) => void;
-
-/**
- * Wrap a logger so every line carries `pid` + `instance`.
- *
- * Field precedence: injected fields first, caller fields last, so a caller
- * field wins. This deliberately matches mcp-logger's own envelope, which
- * spreads `...fields` after `ts`/`server`/`level`/`event` — a caller can
- * already override `server` there. Inverting precedence only in this wrapper
- * would make the envelope internally inconsistent about who wins.
- *
- * Note honestly what that costs: a caller-supplied `pid` would override
- * attribution *invisibly* — the line would carry a foreign pid with nothing
- * marking it as such. No caller in this repo sets `pid`, so the impact is
- * currently zero; if one ever does, that is the failure to expect.
- *
- * Non-function properties are passed through untouched. `createLogger` returns
- * an object literal of four functions today, but this repo does not own
- * mcp-logger: if it later exposes a non-function property (a config field, a
- * level), blindly wrapping it would silently replace it with a closure that
- * throws on use.
- */
-export function withProcessAttribution<T extends Record<string, LogFn>>(
-  base: T
-): T {
-  const wrapped: Record<string, unknown> = {};
-  for (const level of Object.keys(base)) {
-    const fn = base[level];
-    if (typeof fn !== "function") {
-      wrapped[level] = fn;
-      continue;
-    }
-    wrapped[level] = (
-      event: string,
-      fields: Record<string, unknown>,
-      msg?: string
-    ) => fn(event, { pid: process.pid, instance: LOG_INSTANCE_ID, ...fields }, msg);
-  }
-  return wrapped as T;
-}
-
-const log = withProcessAttribution(
-  createLogger("watcher") as unknown as Record<string, LogFn>
-) as unknown as ReturnType<typeof createLogger>;
+// Attribution (`pid` + per-process `instance`) is provided NATIVELY by
+// @wave-engineering/mcp-logger >= 1.1.0, injected inside emit() after the level
+// threshold check. This repo previously wrapped the logger to inject them (#54);
+// that wrapper is retired (#57) because native coverage is strictly broader:
+//   - EARLIER: the instance id is module-scope in mcp-logger, evaluated at first
+//     import, so there is no unattributed window before the wrapper was applied.
+//   - BROADER: it attributes every logger in the process — including the
+//     `deps.log` call sites in forward.ts / directmsg.ts — all sharing one id.
+// The dependency is pinned to an EXACT version, not a caret: 1.1.0 reserves
+// `pid`/`instance`, so a range that could drift back to a version without that
+// contract, or forward to one that changes it, is not safe to leave floating.
+const log = createLogger("watcher");
 
 const { guildId: GUILD_ID, tokenPath: CONFIGURED_TOKEN_PATH, screamHoleUrl: CONFIGURED_SCREAM_HOLE_URL, channelAllowlist: CHANNEL_ALLOWLIST } = loadConfig();
 
