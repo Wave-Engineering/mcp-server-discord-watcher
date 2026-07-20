@@ -605,11 +605,22 @@ export interface IdentityBreakerState {
   notified: boolean;
   /** Consecutive unresolved poll cycles in the current episode. */
   cycles: number;
+  /**
+   * Has identity EVER resolved in this process? The startup grace period is
+   * only legitimate before the first successful resolve — see
+   * {@link stepIdentityBreaker}. Without this, an identity that FLAPS on a
+   * sub-grace cycle (unresolved 2, resolved 1, repeat) never accumulates
+   * enough consecutive cycles to notify, so an agent deaf most of the time is
+   * silently deaf — the exact failure #28 exists to eliminate, reintroduced by
+   * the fix for the startup false alarm.
+   */
+  everResolved: boolean;
 }
 
 export const INITIAL_IDENTITY_BREAKER: IdentityBreakerState = {
   notified: false,
   cycles: 0,
+  everResolved: false,
 };
 
 /** What the caller should do this cycle, given the breaker transition. */
@@ -647,7 +658,7 @@ export function stepIdentityBreaker(
     // is silent. Resetting `notified` is what re-arms the breaker.
     const recovered = prev.notified || prev.cycles > 0;
     return {
-      state: { ...INITIAL_IDENTITY_BREAKER },
+      state: { ...INITIAL_IDENTITY_BREAKER, everResolved: true },
       notify: false,
       warn: false,
       recovered,
@@ -661,9 +672,19 @@ export function stepIdentityBreaker(
   // IDENTITY_NOTIFY_AFTER_CYCLES. `notified` latches only when we actually
   // notify, so the grace window does not silently consume the episode's one
   // notification.
-  const notify = !prev.notified && cycles >= IDENTITY_NOTIFY_AFTER_CYCLES;
+  // The grace period is a STARTUP allowance, not a per-episode one. Once
+  // identity has resolved even once, any later unresolved cycle is a genuine
+  // regression and notifies immediately — otherwise a flapping identity that
+  // never reaches the grace threshold would be silent forever.
+  const notify =
+    !prev.notified &&
+    (prev.everResolved || cycles >= IDENTITY_NOTIFY_AFTER_CYCLES);
   return {
-    state: { notified: prev.notified || notify, cycles },
+    state: {
+      notified: prev.notified || notify,
+      cycles,
+      everResolved: prev.everResolved,
+    },
     notify,
     warn: cycles === 1 || cycles % n === 0,
     recovered: false,

@@ -647,7 +647,9 @@ describe("stepIdentityBreaker (#28)", () => {
   test("healthy steady state is completely silent", () => {
     const s = stepIdentityBreaker(INITIAL_IDENTITY_BREAKER, true, 100);
     expect(s).toEqual({
-      state: { notified: false, cycles: 0 },
+      // everResolved flips true: the startup grace is spent once identity has
+      // been seen, so a LATER outage notifies immediately rather than waiting.
+      state: { notified: false, cycles: 0, everResolved: true },
       notify: false,
       warn: false,
       recovered: false,
@@ -666,7 +668,7 @@ describe("stepIdentityBreaker (#28)", () => {
       st = s.state;
     }
     expect(notifyCount).toBe(1);
-    expect(st).toEqual({ notified: true, cycles: IDENTITY_NOTIFY_AFTER_CYCLES });
+    expect(st).toEqual({ notified: true, cycles: IDENTITY_NOTIFY_AFTER_CYCLES, everResolved: false });
   });
 
   test("does NOT re-notify on subsequent cycles of the same episode", () => {
@@ -694,6 +696,48 @@ describe("stepIdentityBreaker (#28)", () => {
     expect(warned).toEqual([1, 10, 20]);
   });
 
+  test("BLIND SPOT: a FLAPPING identity must not stay silent forever", () => {
+    // Found by @babelfish asking whether the grace period suppresses a REAL
+    // outage beginning inside its window. It did — but the dangerous case was
+    // not a delayed alert, it was a permanently silent one.
+    //
+    // Before the fix: unresolved 2 cycles, resolved 1, repeat. Consecutive
+    // cycles never reach the grace threshold, so notify NEVER fired — an agent
+    // deaf ~2/3 of the time with no alert, which is precisely the silent-outage
+    // class #28 exists to kill, reintroduced by the fix for the startup false
+    // alarm. Measured: 40 unresolved cycles across 20 rounds, 0 notifications.
+    let st = { ...INITIAL_IDENTITY_BREAKER };
+    let fired = 0;
+    for (let round = 0; round < 20; round++) {
+      for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES - 1; i++) {
+        const s = stepIdentityBreaker(st, false, 100);
+        if (s.notify) fired++;
+        st = s.state;
+      }
+      st = stepIdentityBreaker(st, true, 100).state; // brief resolve
+    }
+    expect(fired).toBeGreaterThan(0);
+  });
+
+  test("the grace period is a STARTUP allowance, not a per-episode one", () => {
+    // Pre-first-resolve: grace applies, so the /name startup race stays quiet.
+    let st = { ...INITIAL_IDENTITY_BREAKER };
+    const early: number[] = [];
+    for (let i = 1; i <= IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+      const s = stepIdentityBreaker(st, false, 100);
+      if (s.notify) early.push(i);
+      st = s.state;
+    }
+    expect(early).toEqual([IDENTITY_NOTIFY_AFTER_CYCLES]);
+
+    // Post-resolve: grace is spent. A later outage notifies on cycle 1, because
+    // identity working once proves the file CAN resolve — so its absence now is
+    // a regression, not a startup race.
+    st = stepIdentityBreaker(st, true, 100).state;
+    expect(st.everResolved).toBe(true);
+    expect(stepIdentityBreaker(st, false, 100).notify).toBe(true);
+  });
+
   test("RECOVER: resolving after an episode reports recovery", () => {
     let armed = INITIAL_IDENTITY_BREAKER;
     for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
@@ -703,7 +747,7 @@ describe("stepIdentityBreaker (#28)", () => {
     expect(s.recovered).toBe(true);
     expect(s.notify).toBe(false);
     expect(s.warn).toBe(false);
-    expect(s.state).toEqual({ notified: false, cycles: 0 });
+    expect(s.state).toEqual({ notified: false, cycles: 0, everResolved: true });
   });
 
   test("RE-ARM: a second outage notifies again (the /tmp-wipe-twice case)", () => {
@@ -746,10 +790,10 @@ describe("stepIdentityBreaker (#28)", () => {
     // (An earlier version asserted only `typeof warn === "boolean"`, which a
     // NaN comparison also satisfies — it would have stayed green through the
     // exact regression it claimed to guard.)
-    expect(stepIdentityBreaker({ notified: true, cycles: 99 }, false, 0).warn).toBe(true);
+    expect(stepIdentityBreaker({ notified: true, cycles: 99, everResolved: false }, false, 0).warn).toBe(true);
     // And a non-multiple still does not warn — proves it fell back to a real
     // cadence rather than warning unconditionally.
-    expect(stepIdentityBreaker({ notified: true, cycles: 41 }, false, 0).warn).toBe(false);
+    expect(stepIdentityBreaker({ notified: true, cycles: 41, everResolved: false }, false, 0).warn).toBe(false);
   });
 
   test("grace period: no notification before IDENTITY_NOTIFY_AFTER_CYCLES", () => {
