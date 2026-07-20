@@ -44,12 +44,26 @@ describe("workflow dependency installs (#56)", () => {
     expect(bare).toEqual([]);
   });
 
-  test("the registry auth token is never written to the tracked .npmrc path", () => {
-    // CI legitimately appends a token to .npmrc — safe because the runner is
-    // ephemeral. This pins that it stays inside a workflow: the same line in a
-    // script that a developer might run locally would commit a live credential,
-    // because .npmrc is tracked in this repo.
-    const tracked = readFileSync(join(import.meta.dir, "..", ".npmrc"), "utf-8");
-    expect(tracked).not.toMatch(/_authToken\s*=\s*\S/);
+  test("the registry auth token is never COMMITTED to .npmrc", () => {
+    // Asserts the COMMITTED blob, not the working-tree file.
+    //
+    // The first version of this test read `.npmrc` off disk. It passed locally
+    // and FAILED in CI — because ci.yml appends the token to .npmrc before the
+    // tests run, which is legitimate: the runner is ephemeral and the file dies
+    // with the job. The property that actually matters is that the token is
+    // never COMMITTED, and the working tree cannot answer that question.
+    //
+    // That is the defect this suite exists to catch, one level up: a guard
+    // measuring a different artifact than the one it claims to protect.
+    const r = Bun.spawnSync(["git", "show", "HEAD:.npmrc"], {
+      cwd: join(import.meta.dir, ".."),
+    });
+    // Fail loudly rather than vacuously if git or the path is unavailable — a
+    // guard that silently checks nothing is worse than no guard at all.
+    expect(r.exitCode).toBe(0);
+    const committed = new TextDecoder().decode(r.stdout);
+    expect(committed.length).toBeGreaterThan(0);
+    expect(committed).toMatch(/npm\.pkg\.github\.com/); // sanity: correct file
+    expect(committed).not.toMatch(/_authToken\s*=\s*\S/);
   });
 });
