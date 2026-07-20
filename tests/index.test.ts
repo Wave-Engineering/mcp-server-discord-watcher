@@ -9,7 +9,7 @@
  */
 
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DiscordMessage, DiscordAttachment, DiscordConfig } from "../index";
@@ -33,6 +33,14 @@ import {
   refreshChannelList,
   describeAuthHeader,
   classifyFetchFailure,
+  identityPaths,
+  identityWarnCycles,
+  stepIdentityBreaker,
+  INITIAL_IDENTITY_BREAKER,
+  DEFAULT_IDENTITY_WARN_CYCLES,
+  IDENTITY_NOTIFY_AFTER_CYCLES,
+  reportIdentityState,
+  __resetIdentityBreakerForTests,
   refreshIdentity,
   fetchMessageById,
   DISCORD_API_BASE,
@@ -459,6 +467,42 @@ describe("mcp-logger attribution contract (#57)", () => {
   });
 });
 
+// --- #28: unresolved-identity breaker ---------------------------------------
+//
+// The bug this guards: delivery fails CLOSED on unresolved identity (correct)
+// but also failed SILENT, so a wiped identity file deafened an agent with no
+// event to correlate — a multi-day outage in June, recurring live 2026-07-19.
+
+describe("identityPaths (#28)", () => {
+  test("names both locations under the resolved project root", () => {
+    const prev = process.env.CLAUDE_PROJECT_DIR;
+    process.env.CLAUDE_PROJECT_DIR = "/tmp/proj-x";
+    try {
+      const p = identityPaths();
+      expect(p.projectRoot).toBe("/tmp/proj-x");
+      expect(p.durableFile).toBe("/tmp/proj-x/.claude/agent-identity.json");
+      expect(p.legacyTmpFile).toMatch(/^\/tmp\/claude-agent-[0-9a-f]{32}\.json$/);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+      else process.env.CLAUDE_PROJECT_DIR = prev;
+    }
+  });
+
+  test("durable and legacy paths differ for different roots (md5 keyed)", () => {
+    const prev = process.env.CLAUDE_PROJECT_DIR;
+    try {
+      process.env.CLAUDE_PROJECT_DIR = "/tmp/a";
+      const a = identityPaths().legacyTmpFile;
+      process.env.CLAUDE_PROJECT_DIR = "/tmp/b";
+      const b = identityPaths().legacyTmpFile;
+      expect(a).not.toBe(b);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+      else process.env.CLAUDE_PROJECT_DIR = prev;
+    }
+  });
+});
+
 describe("describeAuthHeader (#54)", () => {
   // Deliberately NOT shaped like a real Discord token (no base64.ts.hmac
   // segments). A realistic-looking fake trips GitHub push protection and,
@@ -576,6 +620,331 @@ describe("classifyFetchFailure (#48)", () => {
     // being read as an authoritative Discord deletion.
     expect(classifyFetchFailure(404, { code: "10008" })).toBe("error");
     expect(classifyFetchFailure(404, { code: null })).toBe("error");
+  });
+});
+
+describe("identityWarnCycles (#28)", () => {
+  test("defaults when unset", () => {
+    expect(identityWarnCycles({} as any)).toBe(DEFAULT_IDENTITY_WARN_CYCLES);
+  });
+
+  test("honours a valid positive integer override", () => {
+    expect(identityWarnCycles({ DISCORD_IDENTITY_WARN_CYCLES: "5" } as any)).toBe(5);
+  });
+
+  test("falls back on junk rather than disabling the warning", () => {
+    // A 0 / negative / non-numeric value must NOT silence the warn entirely —
+    // that would recreate the silent-outage bug via config.
+    for (const v of ["0", "-1", "abc", "1.5", ""]) {
+      expect(
+        identityWarnCycles({ DISCORD_IDENTITY_WARN_CYCLES: v } as any)
+      ).toBe(DEFAULT_IDENTITY_WARN_CYCLES);
+    }
+  });
+});
+
+describe("stepIdentityBreaker (#28)", () => {
+  test("healthy steady state is completely silent", () => {
+    const s = stepIdentityBreaker(INITIAL_IDENTITY_BREAKER, true, 100);
+    expect(s).toEqual({
+      // everResolved flips true: the startup grace is spent once identity has
+      // been seen, so a LATER outage notifies immediately rather than waiting.
+      state: { notified: false, cycles: 0, everResolved: true },
+      notify: false,
+      warn: false,
+      recovered: false,
+    });
+  });
+
+  test("ARM: warns immediately, notifies once the grace period elapses", () => {
+    // Intent unchanged (an outage arms the breaker and fires exactly one
+    // notification); the grace period only defers WHEN the notification lands.
+    let st = INITIAL_IDENTITY_BREAKER;
+    let notifyCount = 0;
+    for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+      const s = stepIdentityBreaker(st, false, 100);
+      if (i === 0) expect(s.warn).toBe(true); // warn is NOT deferred
+      if (s.notify) notifyCount++;
+      st = s.state;
+    }
+    expect(notifyCount).toBe(1);
+    expect(st).toEqual({ notified: true, cycles: IDENTITY_NOTIFY_AFTER_CYCLES, everResolved: false });
+  });
+
+  test("does NOT re-notify on subsequent cycles of the same episode", () => {
+    // advance past the grace so the single notification has already fired
+    let st = INITIAL_IDENTITY_BREAKER;
+    for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+      st = stepIdentityBreaker(st, false, 100).state;
+    }
+    for (let i = 0; i < 50; i++) {
+      const s = stepIdentityBreaker(st, false, 100);
+      expect(s.notify).toBe(false); // one notification per episode, not per cycle
+      st = s.state;
+    }
+    expect(st.cycles).toBe(IDENTITY_NOTIFY_AFTER_CYCLES + 50);
+  });
+
+  test("warn is throttled to every Nth cycle while unresolved", () => {
+    let st = INITIAL_IDENTITY_BREAKER;
+    const warned: number[] = [];
+    for (let i = 0; i < 25; i++) {
+      const s = stepIdentityBreaker(st, false, 10);
+      if (s.warn) warned.push(s.state.cycles);
+      st = s.state;
+    }
+    expect(warned).toEqual([1, 10, 20]);
+  });
+
+  test("BLIND SPOT: a FLAPPING identity must not stay silent forever", () => {
+    // Found by @babelfish asking whether the grace period suppresses a REAL
+    // outage beginning inside its window. It did — but the dangerous case was
+    // not a delayed alert, it was a permanently silent one.
+    //
+    // Before the fix: unresolved 2 cycles, resolved 1, repeat. Consecutive
+    // cycles never reach the grace threshold, so notify NEVER fired — an agent
+    // deaf ~2/3 of the time with no alert, which is precisely the silent-outage
+    // class #28 exists to kill, reintroduced by the fix for the startup false
+    // alarm. Measured: 40 unresolved cycles across 20 rounds, 0 notifications.
+    let st = { ...INITIAL_IDENTITY_BREAKER };
+    let fired = 0;
+    for (let round = 0; round < 20; round++) {
+      for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES - 1; i++) {
+        const s = stepIdentityBreaker(st, false, 100);
+        if (s.notify) fired++;
+        st = s.state;
+      }
+      st = stepIdentityBreaker(st, true, 100).state; // brief resolve
+    }
+    expect(fired).toBeGreaterThan(0);
+  });
+
+  test("the grace period is a STARTUP allowance, not a per-episode one", () => {
+    // Pre-first-resolve: grace applies, so the /name startup race stays quiet.
+    let st = { ...INITIAL_IDENTITY_BREAKER };
+    const early: number[] = [];
+    for (let i = 1; i <= IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+      const s = stepIdentityBreaker(st, false, 100);
+      if (s.notify) early.push(i);
+      st = s.state;
+    }
+    expect(early).toEqual([IDENTITY_NOTIFY_AFTER_CYCLES]);
+
+    // Post-resolve: grace is spent. A later outage notifies on cycle 1, because
+    // identity working once proves the file CAN resolve — so its absence now is
+    // a regression, not a startup race.
+    st = stepIdentityBreaker(st, true, 100).state;
+    expect(st.everResolved).toBe(true);
+    expect(stepIdentityBreaker(st, false, 100).notify).toBe(true);
+  });
+
+  test("RECOVER: resolving after an episode reports recovery", () => {
+    let armed = INITIAL_IDENTITY_BREAKER;
+    for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+      armed = stepIdentityBreaker(armed, false, 100).state;
+    }
+    const s = stepIdentityBreaker(armed, true, 100);
+    expect(s.recovered).toBe(true);
+    expect(s.notify).toBe(false);
+    expect(s.warn).toBe(false);
+    expect(s.state).toEqual({ notified: false, cycles: 0, everResolved: true });
+  });
+
+  test("RE-ARM: a second outage notifies again (the /tmp-wipe-twice case)", () => {
+    const runEpisode = (from: typeof INITIAL_IDENTITY_BREAKER) => {
+      let st = from, notified = false;
+      for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+        const s = stepIdentityBreaker(st, false, 100);
+        if (s.notify) notified = true;
+        st = s.state;
+      }
+      return { st, notified };
+    };
+    // episode 1
+    const e1 = runEpisode(INITIAL_IDENTITY_BREAKER);
+    expect(e1.notified).toBe(true);
+    // recovered — /name run
+    const b = stepIdentityBreaker(e1.st, true, 100);
+    expect(b.recovered).toBe(true);
+    // episode 2 — file wiped again (reboot). MUST notify again, unlike the
+    // auth breaker which is one-shot-per-process.
+    const e2 = runEpisode(b.state);
+    expect(e2.notified).toBe(true);
+  });
+
+  test("recovery does not fire twice for one episode", () => {
+    let armed = INITIAL_IDENTITY_BREAKER;
+    for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+      armed = stepIdentityBreaker(armed, false, 100).state;
+    }
+    const first = stepIdentityBreaker(armed, true, 100);
+    expect(first.recovered).toBe(true);
+    const second = stepIdentityBreaker(first.state, true, 100);
+    expect(second.recovered).toBe(false); // steady healthy, stays silent
+  });
+
+  test("a junk warnEveryN falls back to the default CADENCE, not to silence", () => {
+    // Discriminating by construction: under the correct guard, warnEveryN=0
+    // falls back to 100, so cycle 100 MUST warn. Under a modulo-by-zero
+    // regression `100 % 0 === 0` → `NaN === 0` → false, and this fails.
+    // (An earlier version asserted only `typeof warn === "boolean"`, which a
+    // NaN comparison also satisfies — it would have stayed green through the
+    // exact regression it claimed to guard.)
+    expect(stepIdentityBreaker({ notified: true, cycles: 99, everResolved: false }, false, 0).warn).toBe(true);
+    // And a non-multiple still does not warn — proves it fell back to a real
+    // cadence rather than warning unconditionally.
+    expect(stepIdentityBreaker({ notified: true, cycles: 41, everResolved: false }, false, 0).warn).toBe(false);
+  });
+
+  test("grace period: no notification before IDENTITY_NOTIFY_AFTER_CYCLES", () => {
+    // The /name-at-startup race: identity is briefly unresolved while /name is
+    // running. Notifying on cycle 1 would tell the agent to run the thing it is
+    // running, and an alert that fires every startup is one nobody reads.
+    let st = INITIAL_IDENTITY_BREAKER;
+    const notifiedOn: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      const s = stepIdentityBreaker(st, false, 100);
+      if (s.notify) notifiedOn.push(s.state.cycles);
+      st = s.state;
+    }
+    expect(notifiedOn).toEqual([IDENTITY_NOTIFY_AFTER_CYCLES]);
+  });
+
+  test("grace period does NOT consume the episode's notification", () => {
+    // Recovering inside the grace window must leave the breaker un-latched, so
+    // a later genuine outage still notifies.
+    let s = stepIdentityBreaker(INITIAL_IDENTITY_BREAKER, false, 100);
+    expect(s.notify).toBe(false);
+    expect(s.state.notified).toBe(false); // not latched — nothing was sent
+    s = stepIdentityBreaker(s.state, true, 100); // /name landed in time
+    expect(s.recovered).toBe(true);
+  });
+
+  test("warn still fires on cycle 1 — diagnosability is not delayed by the grace", () => {
+    const s = stepIdentityBreaker(INITIAL_IDENTITY_BREAKER, false, 100);
+    expect(s.warn).toBe(true);
+    expect(s.notify).toBe(false);
+  });
+});
+
+// --- #28: the WIRING between the pure breaker and the running poll loop ------
+//
+// The state machine above can be perfect while the feature delivers nothing if
+// reportIdentityState is never called, or is called with the wrong inputs —
+// structurally the same failure as #28 itself (correct logic, no signal).
+
+describe("reportIdentityState wiring (#28)", () => {
+  function fakeServer() {
+    const sent: any[] = [];
+    return {
+      sent,
+      server: { notification: async (n: any) => void sent.push(n) } as any,
+    };
+  }
+
+  const IDENT = join(tmpdir(), "id28-wiring");
+
+  beforeEach(() => {
+    __resetIdentityBreakerForTests();
+    process.env.CLAUDE_PROJECT_DIR = IDENT;
+    rmSync(join(IDENT, ".claude"), { recursive: true, force: true });
+    mkdirSync(join(IDENT, ".claude"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(IDENT, { recursive: true, force: true });
+    delete process.env.CLAUDE_PROJECT_DIR;
+    __resetIdentityBreakerForTests();
+  });
+
+  function writeIdentity() {
+    writeFileSync(
+      join(IDENT, ".claude", "agent-identity.json"),
+      JSON.stringify({ dev_name: "polyjuice", dev_team: "oaw" })
+    );
+  }
+  function wipeIdentity() {
+    rmSync(join(IDENT, ".claude", "agent-identity.json"), { force: true });
+  }
+
+  test("resolved identity → no notification is ever emitted", async () => {
+    writeIdentity();
+    const { server, sent } = fakeServer();
+    refreshIdentity();
+    for (let i = 0; i < 5; i++) await reportIdentityState(server);
+    expect(sent).toHaveLength(0);
+  });
+
+  test("unresolved → emits exactly one notification, after the grace period", async () => {
+    wipeIdentity();
+    const { server, sent } = fakeServer();
+    refreshIdentity();
+    for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES - 1; i++) {
+      await reportIdentityState(server);
+    }
+    expect(sent).toHaveLength(0); // still inside the grace window
+    await reportIdentityState(server);
+    expect(sent).toHaveLength(1);
+    // …and does not repeat for the rest of the episode
+    for (let i = 0; i < 20; i++) await reportIdentityState(server);
+    expect(sent).toHaveLength(1);
+  });
+
+  test("the notification names BOTH identity paths and says delivery is suspended", async () => {
+    wipeIdentity();
+    const { server, sent } = fakeServer();
+    refreshIdentity();
+    for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+      await reportIdentityState(server);
+    }
+    const body = sent[0].params.content as string;
+    // Naming the exact files is the point — "run /name" without saying where it
+    // looked is why the June outage took three days to diagnose.
+    expect(body).toContain(join(IDENT, ".claude", "agent-identity.json"));
+    expect(body).toContain("/tmp/claude-agent-");
+    expect(body).toContain("/name");
+    expect(body.toUpperCase()).toContain("IDENTITY UNRESOLVED");
+  });
+
+  test("re-arms: a second outage notifies again after a recovery", async () => {
+    const { server, sent } = fakeServer();
+    // episode 1
+    wipeIdentity();
+    refreshIdentity();
+    for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+      await reportIdentityState(server);
+    }
+    expect(sent).toHaveLength(1);
+    // recovery
+    writeIdentity();
+    refreshIdentity();
+    await reportIdentityState(server);
+    // episode 2 — the reboot-wipes-it-again case
+    wipeIdentity();
+    refreshIdentity();
+    for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+      await reportIdentityState(server);
+    }
+    expect(sent).toHaveLength(2);
+  });
+
+  test("a failed notification is retried rather than consuming the episode", async () => {
+    wipeIdentity();
+    refreshIdentity();
+    let fail = true;
+    const sent: any[] = [];
+    const server = {
+      notification: async (n: any) => {
+        if (fail) throw new Error("transport down");
+        sent.push(n);
+      },
+    } as any;
+    for (let i = 0; i < IDENTITY_NOTIFY_AFTER_CYCLES; i++) {
+      await reportIdentityState(server);
+    }
+    expect(sent).toHaveLength(0); // threw
+    fail = false;
+    await reportIdentityState(server);
+    expect(sent).toHaveLength(1); // retried, episode not consumed
   });
 });
 
