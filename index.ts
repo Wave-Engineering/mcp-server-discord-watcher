@@ -467,6 +467,26 @@ export interface AgentIdentity {
 
 let cachedIdentity: AgentIdentity = { devName: null, devTeam: null };
 
+/**
+ * The identity locations, in read order. Exported so the unresolved-identity
+ * notification can name the exact paths the operator must create (#28) rather
+ * than describing them — a message that says "run /name" without saying *where*
+ * it looked is what made the 2026-06-01 outage take three days to spot.
+ */
+export function identityPaths(): {
+  projectRoot: string;
+  durableFile: string;
+  legacyTmpFile: string;
+} {
+  const projectRoot = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+  const dirHash = createHash("md5").update(projectRoot).digest("hex");
+  return {
+    projectRoot,
+    durableFile: join(projectRoot, ".claude", "agent-identity.json"),
+    legacyTmpFile: `/tmp/claude-agent-${dirHash}.json`,
+  };
+}
+
 export function resolveIdentity(): AgentIdentity {
   // Claude Code sets CLAUDE_PROJECT_DIR in every spawned MCP server's environment
   // to the session project root (the locked identity-path contract) — it is the
@@ -474,16 +494,12 @@ export function resolveIdentity(): AgentIdentity {
   // if it is somehow unset. We dropped `git rev-parse --show-toplevel`, which
   // returned the *wrong* toplevel whenever the watcher's cwd sat inside an
   // unrelated git repo — the nested-repo hazard cacophonix flagged on #34.
-  const projectRoot = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
-
   // Read order (cc-workflow #723): the durable project-local file first, then
   // the legacy /tmp path during the transition window. /tmp is emptied on every
   // reboot (systemd-tmpfiles `D /tmp`), so a watcher that booted after a reboot
   // resolved a null identity from /tmp — the null-at-boot over-broad bleed. The
   // project-local `.claude/` file survives reboots.
-  const durableFile = join(projectRoot, ".claude", "agent-identity.json");
-  const dirHash = createHash("md5").update(projectRoot).digest("hex");
-  const legacyTmpFile = `/tmp/claude-agent-${dirHash}.json`;
+  const { projectRoot, durableFile, legacyTmpFile } = identityPaths();
 
   for (const file of [durableFile, legacyTmpFile]) {
     try {
@@ -534,6 +550,124 @@ export function refreshIdentity(): boolean {
   });
   cachedIdentity = next;
   return true;
+}
+
+// --- Unresolved-identity circuit breaker (#28) -------------------------------
+//
+// shouldDeliverMessage fails CLOSED on unresolved identity — correct, and kept
+// (deaf beats over-broad). The bug was that it also failed SILENT: the poll loop
+// logged healthy cycles while delivering nothing, so a wiped identity file
+// deafened an agent with no event to correlate. That produced a multi-day
+// fleet-wide outage (2026-06-01 → 06-03) noticed only when a human asked why
+// agents had gone quiet, and it recurred live on 2026-07-19.
+//
+// This mirrors the auth-failure breaker, with one deliberate difference: auth
+// latches until restart, whereas identity RE-ARMS. Identity self-heals the
+// moment the file reappears (refreshIdentity runs every cycle), so an outage is
+// an *episode* with a start and an end, and each new episode deserves its own
+// notification.
+
+/** Default cycles between repeat `identity_outage` warn logs. */
+export const DEFAULT_IDENTITY_WARN_CYCLES = 100;
+
+/**
+ * Unresolved cycles to tolerate before NOTIFYING the session (~45s at a 15s
+ * poll). `/name` runs at session start and takes non-trivial time — load the
+ * skill, pick a name, write the file, announce, check in on Discord — which can
+ * exceed one poll interval. Without this grace the watcher's first cycle would
+ * tell the agent "identity unresolved, run /name" while it is *at that moment*
+ * running /name, then immediately recover.
+ *
+ * That false alarm is not merely noisy, it is corrosive: an alert that fires on
+ * nearly every startup is one everyone learns to ignore, and the next real
+ * multi-day outage then produces a notification indistinguishable from routine
+ * startup noise — defeating the entire point of the breaker.
+ *
+ * The warn LOG still fires on cycle 1 (diagnosability is not delayed); only the
+ * session-facing notification waits. Against an outage measured in days, 45s of
+ * grace costs nothing.
+ */
+export const IDENTITY_NOTIFY_AFTER_CYCLES = 3;
+
+/**
+ * Cycles between repeat warn logs while identity is unresolved. Override with
+ * `DISCORD_IDENTITY_WARN_CYCLES`; a non-positive or non-integer value falls
+ * back to the default rather than disabling the warning entirely.
+ */
+export function identityWarnCycles(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.DISCORD_IDENTITY_WARN_CYCLES);
+  return Number.isInteger(n) && n > 0 ? n : DEFAULT_IDENTITY_WARN_CYCLES;
+}
+
+/** Breaker state for the current unresolved-identity episode. */
+export interface IdentityBreakerState {
+  /** Has the one-per-episode MCP notification already fired? */
+  notified: boolean;
+  /** Consecutive unresolved poll cycles in the current episode. */
+  cycles: number;
+}
+
+export const INITIAL_IDENTITY_BREAKER: IdentityBreakerState = {
+  notified: false,
+  cycles: 0,
+};
+
+/** What the caller should do this cycle, given the breaker transition. */
+export interface IdentityBreakerStep {
+  state: IdentityBreakerState;
+  /** Emit the one-per-episode MCP notification (delivery is suspended). */
+  notify: boolean;
+  /** Emit a `warn`-level `identity_unresolved` log this cycle. */
+  warn: boolean;
+  /** Identity just came back after an episode — log recovery. */
+  recovered: boolean;
+}
+
+/**
+ * Advance the unresolved-identity breaker by one poll cycle.
+ *
+ * Pure — all I/O stays with the caller — so the arm / fire / re-arm / recover
+ * transitions are directly unit-testable, which is the point: this state
+ * machine is the only thing standing between a wiped identity file and another
+ * silent multi-day outage.
+ *
+ * - unresolved, first cycle of an episode → notify once, warn once
+ * - unresolved, subsequent cycles         → warn every `warnEveryN` cycles
+ * - resolved after an episode             → recovered, state reset (RE-ARMS, so
+ *                                           a later wipe notifies again)
+ * - resolved with no prior episode        → nothing (the healthy steady state)
+ */
+export function stepIdentityBreaker(
+  prev: IdentityBreakerState,
+  resolved: boolean,
+  warnEveryN: number = DEFAULT_IDENTITY_WARN_CYCLES
+): IdentityBreakerStep {
+  if (resolved) {
+    // Only a transition OUT of an episode is a recovery; a steady healthy cycle
+    // is silent. Resetting `notified` is what re-arms the breaker.
+    const recovered = prev.notified || prev.cycles > 0;
+    return {
+      state: { ...INITIAL_IDENTITY_BREAKER },
+      notify: false,
+      warn: false,
+      recovered,
+    };
+  }
+  const cycles = prev.cycles + 1;
+  const n = Number.isInteger(warnEveryN) && warnEveryN > 0
+    ? warnEveryN
+    : DEFAULT_IDENTITY_WARN_CYCLES;
+  // Notify once per episode, but only after the grace period — see
+  // IDENTITY_NOTIFY_AFTER_CYCLES. `notified` latches only when we actually
+  // notify, so the grace window does not silently consume the episode's one
+  // notification.
+  const notify = !prev.notified && cycles >= IDENTITY_NOTIFY_AFTER_CYCLES;
+  return {
+    state: { notified: prev.notified || notify, cycles },
+    notify,
+    warn: cycles === 1 || cycles % n === 0,
+    recovered: false,
+  };
 }
 
 // --- Forward rule (disc forward #68) -----------------------------------------
@@ -1256,6 +1390,94 @@ async function emitAuthFailedNotificationIfNeeded(server: Server): Promise<void>
   }
 }
 
+// Live breaker state for the unresolved-identity episode (#28). Unlike the auth
+// sentinel this is in-process only: identity self-heals, so the state must not
+// survive a restart that may itself have fixed the problem.
+let identityBreaker: IdentityBreakerState = { ...INITIAL_IDENTITY_BREAKER };
+
+/** Reset for tests — the module-level breaker is process-global otherwise. */
+export function __resetIdentityBreakerForTests(): void {
+  identityBreaker = { ...INITIAL_IDENTITY_BREAKER };
+}
+
+/**
+ * Observe the resolved/unresolved identity state for this poll cycle and make
+ * an outage audible: one MCP notification per episode, a throttled warn log
+ * while it persists, and an info log on recovery.
+ *
+ * Delivery semantics are untouched — shouldDeliverMessage still fails closed.
+ * This is purely the missing signal.
+ */
+export async function reportIdentityState(server: Server): Promise<void> {
+  const resolved = Boolean(cachedIdentity.devName && cachedIdentity.devTeam);
+  const step = stepIdentityBreaker(
+    identityBreaker,
+    resolved,
+    identityWarnCycles()
+  );
+  const cycles = identityBreaker.cycles;
+  identityBreaker = step.state;
+
+  if (step.recovered) {
+    log.info("state_change", {
+      what: "identity",
+      to: "resolved",
+      after_unresolved_cycles: cycles,
+      agent: `${cachedIdentity.devName}/${cachedIdentity.devTeam}`,
+    });
+    return;
+  }
+
+  const paths = identityPaths();
+
+  if (step.warn) {
+    // Distinct event name from resolveIdentity's per-cycle `identity_unresolved`
+    // debug line: a log-based alert grepping the event name must be able to match
+    // the BREAKER (outage, warn-level, carries unresolved_cycles) without also
+    // matching the routine debug breadcrumb.
+    log.warn("identity_outage", {
+      project_root: paths.projectRoot,
+      tried: [paths.durableFile, paths.legacyTmpFile],
+      unresolved_cycles: step.state.cycles,
+      delivery: "suspended",
+    });
+  }
+
+  if (step.notify) {
+    try {
+      await server.notification({
+        method: "notifications/claude/channel" as any,
+        params: {
+          content:
+            "[discord-watcher] IDENTITY UNRESOLVED: no agent identity found, so " +
+            "NO Discord messages will be delivered to this session (delivery " +
+            "fails closed). Looked for:\n" +
+            `  ${paths.durableFile}\n` +
+            `  ${paths.legacyTmpFile}\n` +
+            "Run /name to write the identity file. Delivery resumes " +
+            "automatically within one poll cycle — no restart needed.",
+          meta: {
+            channel_name: "system",
+            channel_id: "identity-unresolved",
+            author: "discord-watcher",
+            message_id: `identity-unresolved-${Date.now()}`,
+          },
+        },
+      });
+    } catch (err) {
+      // The episode's one notification did NOT reach the session. Un-latch so
+      // the next cycle retries, rather than letting a transport hiccup consume
+      // the only alert for an outage that may last days.
+      identityBreaker = { ...identityBreaker, notified: false };
+      log.error(
+        "state_change",
+        { what: "identity", to: "notification_failed" },
+        String(err)
+      );
+    }
+  }
+}
+
 async function checkForNewMessages(
   server: Server,
   authHeader: string
@@ -1277,6 +1499,11 @@ async function checkForNewMessages(
   // refreshIdentity() updates the cache AND logs the transition (the null-at-boot
   // self-heal) — the channel already re-resolved every cycle; this adds the log.
   refreshIdentity();
+
+  // Fail LOUD on unresolved identity (#28). Delivery still fails closed below —
+  // this only makes the silence observable, so a wiped identity file surfaces as
+  // an event instead of a quiet multi-day outage.
+  await reportIdentityState(server);
 
   // Re-read the forward rule each cycle (#68) — installable/removable at runtime
   // without a watcher restart, same live-read lifecycle as the identity file.

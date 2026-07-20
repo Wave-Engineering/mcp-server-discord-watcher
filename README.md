@@ -106,6 +106,7 @@ Fallback chain: config file -> environment variables -> hardcoded defaults.
 | `DISCORD_TOKEN_PATH` | `~/secrets/discord-bot-token` | Path to token file |
 | `DISCORD_WATCHER_VERBOSE` | `0` | Set to `1` to bypass message filtering |
 | `DISCORD_WATCHER_CHANNELS` | (unset → deliver from all) | Comma-separated channel ids/names to scope *delivery* to (all channels are still polled) |
+| `DISCORD_IDENTITY_WARN_CYCLES` | Poll cycles between repeat `identity_outage` warn logs while agent identity is unresolved. Default `100`. Invalid values (`0`, negative, non-integer) fall back to the default rather than disabling the warning. |
 | `STT_ENDPOINT` | `http://archer:8300/v1/audio/transcriptions` | Whisper STT endpoint |
 | `STT_MODEL` | `deepdml/faster-whisper-large-v3-turbo-ct2` | STT model name |
 
