@@ -78,6 +78,55 @@ If the bot receives a 429 (rate limit) response, it engages a kill switch at
 `~/.claude/discord-bot.kill` with an expiry timestamp. Polling pauses until the
 expiry passes, then auto-lifts.
 
+### Channels-free doorbell (`doorbell` subcommand)
+
+In sessions where Claude Code's `--channels` flag is unavailable (e.g. locked-down
+client environments), the MCP notification sink is not wired up, so no doorbell
+reaches the agent. The `doorbell` subcommand is the alternate transport:
+
+```
+discord-watcher doorbell
+```
+
+It runs the **same** poll loop and **same** fail-closed delivery gate
+(`shouldDeliverMessage`, identity resolution, channel allowlist) as the MCP
+watcher, but emits each deliverable message as **one line on stdout** instead of
+an MCP notification:
+
+```
+[doorbell] #<channel> channel_id=<id> msg_id=<id> from <author>: <preview>
+```
+
+Arm it with Claude Code's `Monitor` primitive, which turns each stdout line into
+a session notification — including while the agent is idle:
+
+```
+Monitor({ command: "discord-watcher doorbell", persistent: true })
+```
+
+Properties:
+
+- **Self-rearming.** `persistent: true` keeps the background process alive; "wait
+  for the next message" lives in the process, not the agent's memory. There is no
+  trigger to reset after reading.
+- **No busy-wait.** Polling is a cheap REST call (no model inference); the model
+  is engaged only when a deliverable line is emitted — one turn per addressed
+  message. The delivery filter runs **in-process**: only messages that pass
+  `shouldDeliverMessage` are ever emitted, so unaddressed traffic never wakes the
+  model.
+- **Mid-session cutover.** Start (or stop, via `Monitor` `TaskStop`) at any time,
+  even if `--channels` was previously in use.
+- **Cold-start, no replay.** On startup the cursor is seeded to the latest message
+  per channel; pre-existing history is never re-delivered — identical to the MCP
+  watcher's baseline behavior.
+
+**Known boundary:** the cursor is per-process and seeded at startup. A message
+that arrives in the exact instant of a `--channels`→`doorbell` cutover (after the
+MCP watcher's last poll but before the `doorbell` process seeds) is not bridged.
+This matches the MCP watcher's own cold-start semantics. Forward-rule routing
+(`discord-watcher forward`) is intentionally **not** applied in `doorbell` mode —
+it always delivers the local agent's own doorbells.
+
 ## Configuration
 
 ### Discord Config

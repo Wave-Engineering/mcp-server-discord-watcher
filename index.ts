@@ -1768,10 +1768,232 @@ async function main(): Promise<void> {
   });
 }
 
+// --- `doorbell` stdout transport (channels-free doorbell) --------------------
+//
+// Alternate delivery sink for sessions where Claude Code's `--channels` flag is
+// unavailable (e.g. locked-down client environments). Runs the SAME poll and
+// fail-closed delivery gate as the MCP watcher, but emits each deliverable
+// message as one line on STDOUT instead of an MCP `notifications/claude/channel`
+// push (index.ts:1645). Designed to be armed via Claude Code's `Monitor`:
+//
+//   Monitor({ command: "discord-watcher doorbell", persistent: true })
+//
+// Monitor turns each stdout line into a session notification — including while
+// the agent is idle — so "wait for the next message" lives in this background
+// process, never in the agent's memory. There is no trigger to re-arm. Polling
+// is a cheap API call (no model inference); the model is engaged only when a
+// deliverable line is emitted (one turn per addressed message).
+//
+// CRITICAL (lesson_discord_doorbell_inference_storm, 2026-06-20): the delivery
+// filter runs HERE, in-process. Only messages that pass shouldDeliverMessage are
+// emitted — emitting unfiltered traffic would wake the model per-message, the
+// exact fleet inference storm that rate-limited the shared quota.
+//
+// Intentionally does NOT reuse checkForNewMessages(): that path is coupled to an
+// MCP `server` and runs forward-rule routing (#68), which would send this
+// agent's own doorbells AWAY to another session. Doorbell mode always delivers
+// locally; forward-awareness is a deliberate follow-up (out of scope, #72).
+
+const DOORBELL_USAGE =
+  [
+    "usage: discord-watcher doorbell",
+    "",
+    "Runs a foreground poll loop and prints one line per deliverable Discord",
+    "message to stdout. Intended to be armed under Claude Code's Monitor:",
+    "",
+    '  Monitor({ command: "discord-watcher doorbell", persistent: true })',
+    "",
+    "Each emitted line has the form:",
+    "  [doorbell] #<channel> channel_id=<id> msg_id=<id> from <author>: <preview>",
+    "",
+    "On such a line, disc_read the channel_id and respond. Honors the same",
+    "identity gate, channel allowlist, and fail-closed delivery as --channels.",
+  ].join("\n") + "\n";
+
+/**
+ * Render the single stdout line for a deliverable message. Pure (no I/O) so the
+ * line contract is unit-testable. Newlines are collapsed to a single space: a
+ * multi-line preview would split into multiple Monitor events (or a malformed
+ * one) — one physical line == one doorbell.
+ */
+export function formatDoorbellLine(
+  channel: DiscordChannel,
+  msg: DiscordMessage
+): string {
+  const oneLine = (s: string): string => s.replace(/[\r\n]+/g, " ").trim();
+  const raw = oneLine(msg.content ?? "");
+  const clipped = raw.length > 100 ? raw.slice(0, 100) + "…" : raw;
+  const author = oneLine(sanitizeSurrogates(msg.author.username));
+  const preview = sanitizeSurrogates(clipped);
+  const chan = oneLine(sanitizeSurrogates(channel.name));
+  return `[doorbell] #${chan} channel_id=${channel.id} msg_id=${msg.id} from ${author}: ${preview}`;
+}
+
+function emitDoorbell(channel: DiscordChannel, msg: DiscordMessage): void {
+  process.stdout.write(formatDoorbellLine(channel, msg) + "\n");
+}
+
+// Auth-failure announcement latch. The doorbell has no MCP notification channel,
+// so a revoked/expired token is surfaced as a ONE-TIME stderr line instead (the
+// MCP path uses emitAuthFailedNotificationIfNeeded). This latch is fresh module
+// state per process, so a restart yields exactly one new announcement — separate
+// from clearAuthFailed() in runDoorbell, which re-arms the breaker sentinel.
+let doorbellAuthAnnounced = false;
+
+function announceDoorbellAuthFailedOnce(): void {
+  if (doorbellAuthAnnounced) return;
+  doorbellAuthAnnounced = true;
+  process.stderr.write(
+    "discord-watcher doorbell: auth failed (401) — bot token rejected; " +
+      "polling suspended, deaf until the token is fixed and this process restarts\n"
+  );
+}
+
+/**
+ * One poll pass: fetch new messages per channel and emit those that pass the
+ * shared delivery gate. Mirrors the MCP watcher's poll body (index.ts:1540) —
+ * including its kill-switch, auth-breaker, and inter-channel jitter gates — but
+ * with a stdout sink and no forward/server coupling.
+ */
+async function doorbellCycle(authHeader: string): Promise<void> {
+  // Kill switch (operator pause / 429 backoff) and auth-failure breaker gate the
+  // cycle exactly as the MCP path does (index.ts:1506/1513). Without them a
+  // persistent doorbell would ignore an operator pause and, on a revoked token,
+  // spin and log-spam 401s every cycle while going silently deaf (#28).
+  if (checkKillSwitch() === "active") return;
+  if (checkAuthFailed()) {
+    announceDoorbellAuthFailedOnce();
+    return;
+  }
+
+  // Keep identity fresh each cycle — shouldDeliverMessage fails CLOSED on an
+  // unresolved identity, so a wiped identity file makes us MISS, never storm.
+  refreshIdentity();
+
+  let isFirstChannel = true;
+  for (const channel of watchedChannels) {
+    // Inter-channel jitter — spread outbound calls so a many-channel guild does
+    // not fire a tight burst that trips the global rate limit (matches the MCP
+    // watcher, index.ts:1546). Skipped on the first channel (no preceding work).
+    if (!isFirstChannel) await sleep(nextChannelJitterMs());
+    isFirstChannel = false;
+
+    try {
+      const lastId = lastSeenMessageId.get(channel.id);
+
+      // Un-baselined channel (e.g. one added by refreshChannelList mid-run): seed
+      // the cursor only, never replay pre-existing history.
+      if (!lastId) {
+        const result = await apiGet(recentMessageUrl(channel.id), authHeader);
+        if (result.ok) {
+          const msgs = result.data as DiscordMessage[];
+          if (msgs.length > 0) {
+            lastSeenMessageId.set(channel.id, msgs[0].id);
+            for (const m of msgs) markDelivered(m.id);
+          }
+        }
+        continue;
+      }
+
+      const messages = await fetchAllNewMessages(channel.id, lastId, authHeader);
+      if (messages.length === 0) continue;
+
+      // Advance cursor to newest (messages are newest-first); dedup via
+      // deliveredMessageIds guards the boundary. Matches index.ts:1575.
+      lastSeenMessageId.set(channel.id, messages[0].id);
+
+      // Deliver-scope: poll every channel, emit only from allowlisted ones.
+      if (!isChannelInScope(channel, CHANNEL_ALLOWLIST)) continue;
+
+      for (const msg of messages.reverse()) {
+        if (deliveredMessageIds.has(msg.id)) continue;
+        if (!shouldDeliverMessage(msg, cachedIdentity, { verbose: VERBOSE })) continue;
+        markDelivered(msg.id);
+        emitDoorbell(channel, msg);
+      }
+    } catch (err) {
+      // A transient fetch error on one channel must never kill the loop.
+      log.error("doorbell", { channel: channel.name }, String(err));
+    }
+
+    // A 401 that engaged the breaker mid-cycle — stop hammering 401 for the
+    // remaining channels this cycle and surface the outage once (index.ts:1667).
+    if (checkAuthFailed()) {
+      announceDoorbellAuthFailedOnce();
+      break;
+    }
+  }
+}
+
+/** Foreground doorbell transport. Does not return until SIGINT/SIGTERM. */
+async function runDoorbell(): Promise<void> {
+  clearAuthFailed();
+  refreshIdentity();
+
+  const token = loadToken();
+  const authHeader = `Bot ${token}`;
+  API_BASE = await resolveApiBase(CONFIGURED_SCREAM_HOLE_URL);
+
+  try {
+    watchedChannels = await fetchTextChannels(authHeader);
+    await initializeBaselines(authHeader);
+  } catch (err) {
+    log.error("doorbell", {}, `Initialization failed: ${err}`);
+    process.exit(1);
+  }
+
+  // Diagnostics go to STDERR — stdout is the event stream Monitor consumes, so
+  // only doorbell lines may appear there.
+  process.stderr.write(
+    `discord-watcher doorbell: watching ${watchedChannels.length} channel(s), poll ${POLL_INTERVAL_MS}ms\n`
+  );
+
+  let stopping = false;
+  const onSignal = (): void => {
+    stopping = true;
+    process.exit(0);
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+
+  // Sequential cycles (no overlap) with a fixed inter-cycle sleep for backoff.
+  // Refresh the channel list on the same cadence as the MCP watcher
+  // (CHANNEL_REFRESH_MS) so channels created mid-session are picked up — a
+  // persistent doorbell would otherwise never see them (e.g. per-topic channels
+  // created after startup). refreshChannelList honors the kill switch / auth
+  // breaker and baselines only newly-appeared channels (no history replay).
+  const refreshEveryCycles = Math.max(
+    1,
+    Math.round(CHANNEL_REFRESH_MS / POLL_INTERVAL_MS)
+  );
+  let cyclesSinceRefresh = 0;
+  while (!stopping) {
+    await doorbellCycle(authHeader);
+    if (++cyclesSinceRefresh >= refreshEveryCycles) {
+      cyclesSinceRefresh = 0;
+      await refreshChannelList(authHeader).catch((err) => {
+        log.error("doorbell", {}, `channel refresh failed: ${err}`);
+      });
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
 // Only run when executed directly (not when imported by tests)
 if (import.meta.main) {
-  main().catch((err) => {
-    log.error("startup", {}, `Fatal: ${err}`);
-    process.exit(1);
-  });
+  if (process.argv[2] === "doorbell") {
+    if (process.argv.includes("--help") || process.argv.includes("-h")) {
+      process.stdout.write(DOORBELL_USAGE);
+      process.exit(0);
+    }
+    runDoorbell().catch((err) => {
+      log.error("doorbell", {}, `Fatal: ${err}`);
+      process.exit(1);
+    });
+  } else {
+    main().catch((err) => {
+      log.error("startup", {}, `Fatal: ${err}`);
+      process.exit(1);
+    });
+  }
 }
