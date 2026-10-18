@@ -10,7 +10,7 @@
     "build": "scripts/ci/build.sh"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@wave-engineering/mcp-logger": "1.1.0"
   },
   "devDependencies": {
@@ -18,7 +18,10 @@
   },
   "license": "MIT",
   "overrides": {
-    "fast-uri": "3.1.2",
-    "hono": "4.12.31"
+    "fast-uri": "3.1.8",
+    "hono": "4.12.31",
+    "ip-address": "10.4.0",
+    "express-rate-limit": "8.6.2",
+    "proxy-addr": "2.0.8"
   }
 }
