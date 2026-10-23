@@ -1,0 +1,3 @@
+[test]
+# Refuse to run against the real HOME — see tests/home-guard.ts.
+preload = ["./tests/home-guard.ts"]

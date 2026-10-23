@@ -1094,6 +1094,18 @@ function markDelivered(messageId: string): void {
   }
 }
 
+/**
+ * Reset for tests — the poll state is process-global otherwise. Sets the
+ * watched channels and clears every cursor and the delivered set, so a test can
+ * drive checkForNewMessages / doorbellCycle from a known un-baselined start.
+ */
+export function __resetPollStateForTests(channels: DiscordChannel[]): void {
+  watchedChannels = channels;
+  lastSeenMessageId.clear();
+  deliveredMessageIds.clear();
+  deliveredOrder.length = 0;
+}
+
 // --- Channel discovery -------------------------------------------------------
 
 /**
@@ -1133,23 +1145,65 @@ async function fetchTextChannels(authHeader: string): Promise<DiscordChannel[]> 
   return (result.data as DiscordChannel[]).filter((c) => c.type === 0);
 }
 
+/** How far behind "now" an empty channel's cursor starts. See baselineChannel. */
+const BASELINE_EMPTY_MARGIN_MS = 60_000;
+
+/**
+ * Seed a channel's cursor so later polls deliver only what arrives after it.
+ * The ONE baseline path — startup (initializeBaselines), channel refresh, the
+ * MCP poll's first-poll branch, and the doorbell's un-baselined branch all call
+ * this, so they cannot drift apart again (#81).
+ *
+ * On an OK fetch:
+ *   - one or more messages → cursor at the newest, and every returned message
+ *     is marked delivered: it is the boundary and must never be replayed.
+ *   - NO messages → cursor at a snowflake for "now" minus BASELINE_EMPTY_MARGIN_MS.
+ *     Without this the channel stays un-baselined, the baseline fetch re-runs
+ *     every cycle, and the first message ever to arrive becomes the baseline and
+ *     is swallowed (#81). Through scream-hole any channel quiet for 4h comes back
+ *     empty (recentMessageUrl).
+ *     The margin covers what "now" cannot promise: a host clock ahead of
+ *     Discord's, and scream-hole's ingest lag. A message posted just before the
+ *     fetch but not yet visible to it would otherwise sit below the cursor and be
+ *     lost. Anything the margin admits is a message the empty fetch never
+ *     returned, so delivering it is correct, not a replay; deliveredMessageIds
+ *     still guards duplicates.
+ *
+ * A non-OK fetch leaves the channel un-baselined, so the next cycle retries;
+ * a 429 is logged (apiGet has already engaged the kill switch). Throws only if
+ * the fetch itself throws — each caller keeps its own per-channel catch.
+ */
+async function baselineChannel(
+  channel: DiscordChannel,
+  authHeader: string
+): Promise<void> {
+  const asOf = Date.now() - BASELINE_EMPTY_MARGIN_MS;
+  const result = await apiGet(recentMessageUrl(channel.id), authHeader);
+  if (!result.ok) {
+    if (result.status === 429 && result.retryAfter) {
+      log.warn("api_call", {
+        method: "GET",
+        endpoint: `/channels/${channel.id}/messages`,
+        status: 429,
+        service: API_BASE === DISCORD_API_BASE ? "direct" : "scream-hole",
+        channel: channel.name,
+      });
+    }
+    return;
+  }
+  const messages = result.data as DiscordMessage[];
+  if (messages.length === 0) {
+    lastSeenMessageId.set(channel.id, timestampToSnowflake(asOf));
+    return;
+  }
+  lastSeenMessageId.set(channel.id, messages[0].id);
+  for (const msg of messages) markDelivered(msg.id);
+}
+
 async function initializeBaselines(authHeader: string): Promise<void> {
   for (const channel of watchedChannels) {
     try {
-      const result = await apiGet(
-        recentMessageUrl(channel.id),
-        authHeader
-      );
-      if (result.ok) {
-        const messages = result.data as DiscordMessage[];
-        if (messages.length > 0) {
-          lastSeenMessageId.set(channel.id, messages[0].id);
-          // Mark baseline messages as delivered so they're never re-delivered
-          for (const msg of messages) {
-            markDelivered(msg.id);
-          }
-        }
-      }
+      await baselineChannel(channel, authHeader);
     } catch {
       // Channel might not be readable — skip it
     }
@@ -1356,16 +1410,7 @@ export async function refreshChannelList(authHeader: string): Promise<void> {
 
     if (!lastSeenMessageId.has(ch.id)) {
       try {
-        const result = await apiGet(recentMessageUrl(ch.id), authHeader);
-        if (result.ok) {
-          const msgs = result.data as DiscordMessage[];
-          if (msgs.length > 0) {
-            lastSeenMessageId.set(ch.id, msgs[0].id);
-            for (const msg of msgs) {
-              markDelivered(msg.id);
-            }
-          }
-        }
+        await baselineChannel(ch, authHeader);
       } catch {
         // skip unreadable
       }
@@ -1499,7 +1544,7 @@ export async function reportIdentityState(server: Server): Promise<void> {
   }
 }
 
-async function checkForNewMessages(
+export async function checkForNewMessages(
   server: Server,
   authHeader: string
 ): Promise<void> {
@@ -1553,18 +1598,7 @@ async function checkForNewMessages(
 
       // First poll for this channel — just set baseline
       if (!lastId) {
-        const result = await apiGet(
-          recentMessageUrl(channel.id),
-          authHeader
-        );
-        if (result.ok) {
-          const msgs = result.data as DiscordMessage[];
-          if (msgs.length > 0) {
-            lastSeenMessageId.set(channel.id, msgs[0].id);
-          }
-        } else if (result.status === 429 && result.retryAfter) {
-          log.warn("api_call", { method: "GET", endpoint: `/channels/${channel.id}/messages`, status: 429, service: cycleVia, channel: channel.name });
-        }
+        await baselineChannel(channel, authHeader);
         continue;
       }
 
@@ -1855,7 +1889,7 @@ function announceDoorbellAuthFailedOnce(): void {
  * including its kill-switch, auth-breaker, and inter-channel jitter gates — but
  * with a stdout sink and no forward/server coupling.
  */
-async function doorbellCycle(authHeader: string): Promise<void> {
+export async function doorbellCycle(authHeader: string): Promise<void> {
   // Kill switch (operator pause / 429 backoff) and auth-failure breaker gate the
   // cycle exactly as the MCP path does (index.ts:1506/1513). Without them a
   // persistent doorbell would ignore an operator pause and, on a revoked token,
@@ -1884,14 +1918,7 @@ async function doorbellCycle(authHeader: string): Promise<void> {
       // Un-baselined channel (e.g. one added by refreshChannelList mid-run): seed
       // the cursor only, never replay pre-existing history.
       if (!lastId) {
-        const result = await apiGet(recentMessageUrl(channel.id), authHeader);
-        if (result.ok) {
-          const msgs = result.data as DiscordMessage[];
-          if (msgs.length > 0) {
-            lastSeenMessageId.set(channel.id, msgs[0].id);
-            for (const m of msgs) markDelivered(m.id);
-          }
-        }
+        await baselineChannel(channel, authHeader);
         continue;
       }
 

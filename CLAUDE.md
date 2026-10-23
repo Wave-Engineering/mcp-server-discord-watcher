@@ -188,14 +188,14 @@ Claude Code session when new messages arrive.
 - **Runtime:** Bun
 - **Language:** TypeScript (strict mode)
 - **Protocol:** MCP (Model Context Protocol) over stdio transport
-- **Tests:** `bun test`
+- **Tests:** `./scripts/ci/test.sh` (runs `bun test` under a throwaway HOME)
 - **CI:** GitHub Actions
 
 ### Development
 
 ```bash
 bun install
-bun test
+./scripts/ci/test.sh
 ```
 
 #### Local Installation (dev mode)
@@ -215,7 +215,11 @@ bun test
 ### Testing
 
 Tests live in `tests/`. Only mock true external boundaries (network, filesystem).
-Run the full suite with `bun test`.
+Run the full suite with `./scripts/ci/test.sh`, or `HOME="$(mktemp -d)" bun test`.
+Never run it against the real HOME: it creates and deletes the fleet-wide
+`~/.claude/discord-bot.kill` and `~/.claude/discord-bot.auth-failed` sentinels that
+every live watcher on the box reads. `tests/home-guard.ts` (a `bunfig.toml`
+preload) refuses to run unless HOME is under the temp directory.
 
 ---
 
