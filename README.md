@@ -51,16 +51,20 @@ cd mcp-server-discord-watcher
 
 The watcher connects to Discord's REST API and polls all text channels on the
 configured guild at 15-second intervals. When a new message arrives that is
-addressed to the agent (via `@all`, `@<dev-team>`, or `@<dev-name>`), it sends
+addressed to the agent (via `@agents`, `@<dev-team>`, or `@<dev-name>`), it sends
 an MCP notification to the Claude Code session.
 
 ### Message Filtering
 
 - **Self-echo filtering** -- Messages containing the agent's own signature
   (`-- **<dev-name>**`) are skipped to prevent echo loops.
-- **Targeted routing** -- Only messages addressed to `@all`, `@<dev-team>`, or
+- **Targeted routing** -- Only messages addressed to `@agents`, `@<dev-team>`, or
   `@<dev-name>` are delivered. Set `DISCORD_WATCHER_VERBOSE=1` to bypass
   filtering and receive all messages.
+- **`@agents` is the fleet broadcast; `@all` is being retired** -- On Mattermost,
+  `@all` pages every human in a channel, so the fleet broadcasts with `@agents` on
+  every backend. During the transition the watcher still hears `@all`; set
+  `DISCORD_WATCHER_ACCEPT_ALL=0` to stop hearing it. Send `@agents`.
 - **Channel scoping (deliver-layer)** -- The watcher always polls every text
   channel in the guild (required so channel injection works), but only
   *delivers* wake-ups from channels in its **allowlist**. Set the allowlist via
@@ -174,6 +178,7 @@ Fallback chain: config file -> environment variables -> hardcoded defaults.
 | `DISCORD_TOKEN_PATH` | `~/secrets/discord-bot-token` | Path to token file |
 | `DISCORD_WATCHER_VERBOSE` | `0` | Set to `1` to bypass message filtering |
 | `DISCORD_WATCHER_CHANNELS` | (unset → deliver from all) | Comma-separated channel ids/names to scope *delivery* to (all channels are still polled) |
+| `DISCORD_WATCHER_ACCEPT_ALL` | (unset → on) | Set to `0` to stop hearing the retired `@all` broadcast (#84); `@agents` is always heard. Read at startup; restart the watcher to change it. |
 | `DISCORD_IDENTITY_WARN_CYCLES` | Poll cycles between repeat `identity_outage` warn logs while agent identity is unresolved. Default `100`. Invalid values (`0`, negative, non-integer) fall back to the default rather than disabling the warning. |
 | `STT_ENDPOINT` | `http://archer:8300/v1/audio/transcriptions` | Whisper STT endpoint |
 | `STT_MODEL` | `deepdml/faster-whisper-large-v3-turbo-ct2` | STT model name |
@@ -197,8 +202,8 @@ Two operational notes:
   end-to-end (a real `@<dev-team>` post in an in-scope channel wakes the team; a
   post in an out-of-scope channel does not) -- config-exists is not
   config-works.
-- **`@all` is channel-scoped under deliver-scoping.** Because out-of-scope
-  channels are never delivered, `@all` reaches only agents whose allowlist
+- **`@agents` (and `@all`) is channel-scoped under deliver-scoping.** Because out-of-scope
+  channels are never delivered, a broadcast reaches only agents whose allowlist
   includes the channel the message was posted in. A true cross-team broadcast
   must be posted in a channel present in *every* team's allowlist (a shared
   broadcast channel).
