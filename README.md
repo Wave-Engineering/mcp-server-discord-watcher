@@ -122,9 +122,11 @@ Properties:
   model.
 - **Mid-session cutover.** Start (or stop, via `Monitor` `TaskStop`) at any time,
   even if `--channels` was previously in use.
-- **Cold-start, no replay.** On startup the cursor is seeded to the latest message
-  per channel; pre-existing history is never re-delivered — identical to the MCP
-  watcher's baseline behavior.
+- **Resumes, never replays history.** On startup each channel resumes from the
+  [saved cursor](#saved-poll-cursor) when there is a fresh one, so a re-armed
+  doorbell delivers what arrived while it was down. Without one, the cursor is
+  seeded to the latest message per channel and pre-existing history is never
+  delivered. Both behave exactly as in the MCP watcher.
 - **Never silently deaf.** Problems go to **stderr**, never stdout (stdout carries
   only doorbell lines). An unresolved identity prints one
   `discord-watcher doorbell: identity unresolved …` line naming the files it
@@ -145,10 +147,67 @@ local doorbell line, so it is never lost. Before #82 doorbell mode ignored the
 rule, so the same rule did different things depending on whether the session
 had `--channels`.
 
-**Known boundary:** the cursor is per-process and seeded at startup. A message
-that arrives in the exact instant of a `--channels`→`doorbell` cutover (after the
-MCP watcher's last poll but before the `doorbell` process seeds) is not bridged.
-This matches the MCP watcher's own cold-start semantics.
+**Known boundary:** each transport keeps its own cursor (see below), so a
+`--channels`→`doorbell` cutover is not bridged, and it can go either way:
+
+- With no valid doorbell cursor, the doorbell baselines. A message that arrived
+  after the MCP watcher's last poll and before the doorbell's first start is not
+  delivered by the doorbell.
+- With a doorbell cursor younger than `CURSOR_MAX_AGE_MS` (an earlier doorbell
+  session within 4 h), the doorbell resumes from it. It replays everything since
+  that save, including messages the MCP watcher already delivered, because the
+  delivered set lives in memory only.
+
+Replaying is the safer of the two failures. Restarts and re-arms within one
+transport are bridged.
+
+### Saved poll cursor
+
+Both modes save their poll position, so a restarted MCP watcher or a re-armed
+doorbell (for example under `doorbell-oneshot.sh`, which starts a fresh
+`doorbell` for every batch) delivers the messages that arrived while it was
+down, instead of skipping them.
+
+- **Where.** `${XDG_STATE_HOME:-$HOME/.local/state}/discord-watcher/cursor-<guild>-<dev_team>-<dev_name>-<mcp|doorbell>.json`,
+  one file per guild, agent identity and transport. It holds
+  `{ "version": 1, "saved_at", "api_base", "guild_id", "dev_team", "dev_name", "transport", "channels": { "<channel_id>": "<message_id>" } }`.
+  An agent whose identity is unresolved neither loads nor saves a cursor.
+- **Why one file per transport.** The MCP watcher is installed at user scope, so
+  it also runs in sessions without `--channels`, the very sessions the doorbell
+  is for. There its notifications reach nobody but still succeed, so it moves
+  its cursor past every addressed message. If the doorbell shared that file, a
+  re-arm would resume from the MCP watcher's position and skip what the doorbell
+  never printed.
+- **When it is saved.** Right after each channel's messages are delivered, and
+  once at the end of every poll cycle. The write goes to a temp file in the same
+  directory and is renamed into place, so it is never read half-written. A
+  channel's entry only moves past messages that were delivered, filtered out or
+  forwarded.
+- **Max age: 4 hours** (`CURSOR_MAX_AGE_MS`, scream-hole's cache window). At
+  startup a younger cursor is resumed. An older, unreadable, wrong-identity or
+  wrong-transport one is ignored with one `cursor` log line, and every channel is
+  baselined as before.
+  A channel the cursor does not list is baselined too. Quiet cycles still rewrite
+  the file, so a long quiet spell does not age it out.
+- **Direct vs scream-hole.** A cursor is a Discord message id, and scream-hole
+  serves the same ids, so a cursor saved in one mode is resumed in the other.
+- **Duplicate window.** The set of already-delivered ids is not saved, so a
+  restart can re-deliver what was delivered between the last save and the stop.
+  In MCP mode that gap is the notification round trip.
+- **Doorbell guarantee.** A channel's lines and its save run with nothing in
+  between, so a SIGTERM always finds every line *written* to stdout saved, and
+  nothing not yet written. Written is not read: a consumer must read stdout to
+  EOF after stopping the watcher, or a line still in the pipe is lost with its
+  cursor already saved. (cc-workflow#1286 makes `doorbell-oneshot.sh` do so.)
+- **Failed delivery.** If a channel's pass fails (a thrown transcription or
+  forward, or an MCP notification that throws), its saved entry stays where it
+  was, so a restart *before that channel's next message* re-delivers the
+  messages. The running process has already moved past them, though, so the
+  channel's next good pass saves past them for good.
+
+**Known limit:** two live sessions with the same Dev-Name in one checkout share
+one cursor file (cc-workflow triage #16, identity collision). The last writer
+wins, so one of them can resume past a message only the other delivered.
 
 ## Configuration
 
@@ -180,6 +239,7 @@ Fallback chain: config file -> environment variables -> hardcoded defaults.
 | `DISCORD_WATCHER_CHANNELS` | (unset → deliver from all) | Comma-separated channel ids/names to scope *delivery* to (all channels are still polled) |
 | `DISCORD_WATCHER_ACCEPT_ALL` | (unset → on) | Set to `0` to stop hearing the retired `@all` broadcast (#84); `@agents` is always heard. Read at startup; restart the watcher to change it. |
 | `DISCORD_IDENTITY_WARN_CYCLES` | Poll cycles between repeat `identity_outage` warn logs while agent identity is unresolved. Default `100`. Invalid values (`0`, negative, non-integer) fall back to the default rather than disabling the warning. |
+| `XDG_STATE_HOME` | `~/.local/state` | Base directory for the [saved poll cursor](#saved-poll-cursor) (must be absolute) |
 | `STT_ENDPOINT` | `http://archer:8300/v1/audio/transcriptions` | Whisper STT endpoint |
 | `STT_MODEL` | `deepdml/faster-whisper-large-v3-turbo-ct2` | STT model name |
 

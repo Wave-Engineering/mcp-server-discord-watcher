@@ -12,7 +12,9 @@ echo "--- Running tests ---"
 # on the box reads each cycle, so the tests run against a throwaway HOME.
 # LOG_FILE is dropped too: an agent session exports it as an ABSOLUTE path to the
 # real ~/.claude/logs/mcp.jsonl, which a HOME override alone does not redirect.
-# tests/home-guard.ts (bunfig.toml preload) enforces both for a bare `bun test`.
+# XDG_STATE_HOME is dropped for the same reason: the saved poll cursor lives
+# under it, beside the live watchers' cursors.
+# tests/home-guard.ts (bunfig.toml preload) enforces all three for a bare `bun test`.
 TEST_HOME="$(mktemp -d)"
 trap 'rm -rf "$TEST_HOME"' EXIT
-env -u LOG_FILE HOME="$TEST_HOME" bun test
+env -u LOG_FILE -u XDG_STATE_HOME HOME="$TEST_HOME" bun test

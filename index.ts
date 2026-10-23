@@ -12,7 +12,7 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { sanitizeSurrogates } from "./sanitize.ts";
@@ -1108,8 +1108,218 @@ function markDelivered(messageId: string): void {
 export function __resetPollStateForTests(channels: DiscordChannel[]): void {
   watchedChannels = channels;
   lastSeenMessageId.clear();
+  committedCursor.clear();
+  cursorSaveFailing = false;
   deliveredMessageIds.clear();
   deliveredOrder.length = 0;
+}
+
+// --- Persisted cursor (#83) --------------------------------------------------
+//
+// Without this, every start re-seeds each channel to its newest message, so
+// whatever arrived while the watcher was down is skipped. That bites hardest on
+// doorbell-oneshot (cc-workflow), which starts a fresh `doorbell` on every
+// re-arm: each message posted while the agent handled the last batch was lost.
+//
+// The file holds, per channel, the newest message id whose cycle has FINISHED
+// with it: delivered, filtered, or forwarded. That is `committedCursor`, not
+// `lastSeenMessageId`: the poll core advances lastSeenMessageId before it
+// delivers, and persisting that would let a kill between the two skip messages
+// for good. A channel is committed (and the file saved) right after its delivery
+// pass, in the same synchronous run as the doorbell's last stdout write, so the
+// SIGTERM the oneshot sends after its drain can only land when the file already
+// covers every line written, and no channel polled later in the cycle.
+//
+// Each transport has its OWN file. The MCP watcher is registered at user scope,
+// so it runs in every session, including the no-`--channels` sessions the
+// doorbell exists for. There its notifications go to a sink nobody reads, yet
+// return normally, so it commits every addressed message as delivered. Sharing
+// one file would let it move the doorbell's resume point past messages the
+// doorbell never printed: #83's loss again, in the doorbell's own setting.
+
+/**
+ * How old a saved cursor may be and still be resumed: scream-hole's cache
+ * window, the same 4 h recentMessageUrl uses. An older cursor would ask for
+ * history the proxy no longer holds, and replay hours of traffic direct.
+ */
+export const CURSOR_MAX_AGE_MS = 4 * 60 * 60_000;
+
+/** A saved_at this far in the future (clock skew) is still accepted. */
+const CURSOR_FUTURE_TOLERANCE_MS = 60_000;
+
+/** The two delivery transports. Each keeps its own saved cursor. */
+export type Transport = "mcp" | "doorbell";
+
+/** On-disk cursor shape. Identity and transport fields let a load reject a file that is not ours. */
+export interface CursorFile {
+  version: 1;
+  saved_at: number;
+  api_base: "direct" | "scream-hole";
+  guild_id: string;
+  dev_team: string;
+  dev_name: string;
+  transport: Transport;
+  channels: Record<string, string>;
+}
+
+/** Newest message id per channel whose cycle has finished. What the file holds. */
+const committedCursor = new Map<string, string>();
+
+/** Latched while saves fail, so a read-only state dir logs once, not every 15 s. */
+let cursorSaveFailing = false;
+
+/** A file-name-safe form of one cursor-name component. */
+function cursorNamePart(s: string): string {
+  return s.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+/**
+ * `${XDG_STATE_HOME:-$HOME/.local/state}/discord-watcher/cursor-<guild>-<team>-<name>-<transport>.json`,
+ * or null when the identity is unresolved: such a session neither loads nor
+ * saves. A relative XDG_STATE_HOME is ignored, as the XDG spec requires. Name
+ * parts are sanitized, so two identities CAN share a name ("a.b" and "a_b");
+ * the identity fields inside the file are what a load checks.
+ *
+ * The transport is in the NAME, not only in a field: both transports can run at
+ * once, and a field check alone would have them overwrite each other's file
+ * every cycle and reject it on every load, so neither would ever resume.
+ */
+export function cursorPath(
+  identity: AgentIdentity,
+  transport: Transport,
+  guildId: string = GUILD_ID
+): string | null {
+  if (!identity.devName || !identity.devTeam) return null;
+  const xdg = process.env.XDG_STATE_HOME;
+  const base = xdg && xdg.startsWith("/") ? xdg : join(homedir(), ".local", "state");
+  const file =
+    `cursor-${cursorNamePart(guildId)}-${cursorNamePart(identity.devTeam)}-` +
+    `${cursorNamePart(identity.devName)}-${transport}.json`;
+  return join(base, "discord-watcher", file);
+}
+
+function apiMode(): "direct" | "scream-hole" {
+  return API_BASE === DISCORD_API_BASE ? "direct" : "scream-hole";
+}
+
+/**
+ * Read the saved cursor for the current identity and guild. Returns the
+ * channel → message id map to resume from, or null to baseline every channel as
+ * before. A missing file is the normal first run and is silent; a stale,
+ * unreadable or wrong-identity file is ignored with ONE warn line.
+ *
+ * `api_base` is NOT checked: a cursor is a Discord snowflake, and scream-hole
+ * serves the same ids as Discord, so a cursor saved in one mode is exact in the
+ * other. A change is logged at info level for the record.
+ */
+export function loadCursor(
+  transport: Transport,
+  now: number = Date.now()
+): Map<string, string> | null {
+  const path = cursorPath(cachedIdentity, transport);
+  if (!path) {
+    log.info("cursor", { action: "skipped", reason: "identity unresolved" });
+    return null;
+  }
+  if (!existsSync(path)) return null;
+
+  const ignore = (reason: string, extra: Record<string, unknown> = {}): null => {
+    log.warn("cursor", { action: "ignored", reason, path, ...extra });
+    return null;
+  };
+
+  let data: Partial<CursorFile>;
+  try {
+    data = JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    return ignore("unreadable");
+  }
+  if (typeof data !== "object" || data === null) return ignore("unreadable");
+  if (data.version !== 1) return ignore("unknown version", { version: data.version });
+  if (
+    data.guild_id !== GUILD_ID ||
+    data.dev_team !== cachedIdentity.devTeam ||
+    data.dev_name !== cachedIdentity.devName
+  ) {
+    return ignore("wrong identity");
+  }
+  if (data.transport !== transport) {
+    return ignore("wrong transport", { transport: data.transport });
+  }
+  const channels = data.channels;
+  if (
+    typeof channels !== "object" ||
+    channels === null ||
+    Array.isArray(channels) ||
+    !Object.values(channels).every((id) => typeof id === "string" && /^\d+$/.test(id))
+  ) {
+    return ignore("unreadable");
+  }
+  const savedAt = data.saved_at;
+  if (typeof savedAt !== "number" || !Number.isFinite(savedAt)) {
+    return ignore("unreadable");
+  }
+  const ageMs = now - savedAt;
+  if (ageMs > CURSOR_MAX_AGE_MS || ageMs < -CURSOR_FUTURE_TOLERANCE_MS) {
+    return ignore("stale", { age_ms: ageMs, max_age_ms: CURSOR_MAX_AGE_MS });
+  }
+  if (data.api_base !== apiMode()) {
+    log.info("cursor", { action: "api_base_changed", from: data.api_base, to: apiMode() });
+  }
+  return new Map(Object.entries(channels));
+}
+
+/**
+ * Mark a channel's cursor final for this cycle. Returns true if it moved, so the
+ * caller only rewrites the file when something changed mid-cycle.
+ */
+function commitChannel(channelId: string): boolean {
+  const id = lastSeenMessageId.get(channelId);
+  if (!id || committedCursor.get(channelId) === id) return false;
+  committedCursor.set(channelId, id);
+  return true;
+}
+
+/**
+ * Write the committed cursor for every watched channel: a temp file in the same
+ * directory, then a rename, so no reader ever sees half a file. Synchronous on
+ * purpose (see the section comment). Never throws: a failed save costs the
+ * resume, not the poll loop.
+ */
+export function saveCursor(transport: Transport, now: number = Date.now()): void {
+  const path = cursorPath(cachedIdentity, transport);
+  if (!path || !cachedIdentity.devName || !cachedIdentity.devTeam) return;
+  const channels: Record<string, string> = {};
+  for (const ch of watchedChannels) {
+    const id = committedCursor.get(ch.id);
+    if (id) channels[ch.id] = id;
+  }
+  const data: CursorFile = {
+    version: 1,
+    saved_at: now,
+    api_base: apiMode(),
+    guild_id: GUILD_ID,
+    dev_team: cachedIdentity.devTeam,
+    dev_name: cachedIdentity.devName,
+    transport,
+    channels,
+  };
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(tmp, JSON.stringify(data) + "\n");
+    renameSync(tmp, path);
+    if (cursorSaveFailing) {
+      cursorSaveFailing = false;
+      log.info("cursor", { action: "save_recovered", path });
+    }
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* nothing to clean up */ }
+    if (!cursorSaveFailing) {
+      cursorSaveFailing = true;
+      log.error("cursor", { action: "save_failed", path }, String(err));
+    }
+  }
 }
 
 // --- Channel discovery -------------------------------------------------------
@@ -1198,22 +1408,49 @@ async function baselineChannel(
     return;
   }
   const messages = result.data as DiscordMessage[];
+  // A baseline delivers nothing, so its cursor is final at once (#83).
   if (messages.length === 0) {
     lastSeenMessageId.set(channel.id, timestampToSnowflake(asOf));
-    return;
+  } else {
+    lastSeenMessageId.set(channel.id, messages[0].id);
+    for (const msg of messages) markDelivered(msg.id);
   }
-  lastSeenMessageId.set(channel.id, messages[0].id);
-  for (const msg of messages) markDelivered(msg.id);
+  commitChannel(channel.id);
 }
 
-async function initializeBaselines(authHeader: string): Promise<void> {
+/**
+ * Startup, both modes: resume each channel from this transport's saved cursor
+ * (#83) when one is valid, and baseline the rest as before. Returns how many
+ * channels resumed.
+ */
+export async function initializeBaselines(
+  authHeader: string,
+  transport: Transport
+): Promise<number> {
+  const saved = loadCursor(transport);
+  let resumed = 0;
   for (const channel of watchedChannels) {
+    const savedId = saved?.get(channel.id);
+    if (savedId) {
+      lastSeenMessageId.set(channel.id, savedId);
+      commitChannel(channel.id);
+      resumed++;
+      continue;
+    }
     try {
       await baselineChannel(channel, authHeader);
     } catch {
       // Channel might not be readable — skip it
     }
   }
+  if (saved) {
+    log.info("cursor", {
+      action: "resumed",
+      channels: resumed,
+      baselined: watchedChannels.length - resumed,
+    });
+  }
+  return resumed;
 }
 
 // --- Polling -----------------------------------------------------------------
@@ -1521,6 +1758,8 @@ export async function reportIdentityState(server: Server): Promise<void> {
 
 /** Where a poll cycle's output goes. The two transports differ only here. */
 export interface PollSink {
+  /** Which transport this is: each keeps its own saved cursor (#83). */
+  readonly transport: Transport;
   /** One local message, transcription prepended. Sync sinks return nothing: no await between lines. */
   deliver(channel: DiscordChannel, msg: DiscordMessage, content: string): void | Promise<void>;
   /** The identity breaker fired (once per episode). A throw re-arms it for next cycle. */
@@ -1579,6 +1818,12 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
     isFirstChannel = false;
 
     const ready: { msg: DiscordMessage; content: string }[] = [];
+    // A channel whose pass threw keeps its previous saved entry (#83), until its
+    // next good pass. In-process the cursor has already moved and the ids are
+    // marked delivered, so that pass commits past them: the hold-back only helps
+    // a restart that comes first. Rolling back instead would let one poison
+    // message stall its channel forever.
+    let channelFailed = false;
     try {
       const lastId = lastSeenMessageId.get(channel.id);
 
@@ -1599,6 +1844,7 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
       // is already advanced above, so out-of-scope channels are tracked but
       // never delivered — this is the cross-team leak fix, at the deliver layer.
       if (!isChannelInScope(channel, CHANNEL_ALLOWLIST)) {
+        commitChannel(channel.id); // nothing to deliver; saved at cycle end
         continue;
       }
 
@@ -1621,6 +1867,7 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
         if (content !== null) ready.push({ msg, content });
       }
     } catch (err) {
+      channelFailed = true;
       log.error("poll", { channel: channel.name }, String(err));
     }
 
@@ -1633,8 +1880,19 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
         if (pending) await pending;
       }
     } catch (err) {
+      channelFailed = true;
       log.error("poll", { channel: channel.name }, String(err));
     }
+
+    // Persist this channel now, not at cycle end (#83). For the doorbell sink
+    // this runs in the same synchronous stretch as the lines above, so a SIGTERM
+    // (handled only between event-loop turns) finds the file covering every line
+    // written and no channel not yet polled. A consumer must still read stdout to
+    // EOF after stopping the watcher, or a line written but not yet read is lost
+    // with its cursor committed. Saving before the delivery pass could skip
+    // messages; saving only at cycle end, which a oneshot kill never reaches,
+    // would replay this batch on every re-arm.
+    if (!channelFailed && commitChannel(channel.id)) saveCursor(sink.transport);
 
     // If a 401 was caught mid-cycle (apiGet engaged the auth-failure
     // circuit breaker), break out of the channel loop immediately rather
@@ -1645,6 +1903,11 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
       break;
     }
   }
+
+  // Once per finished cycle, even a quiet one: picks up baselines and
+  // out-of-scope advances, and refreshes saved_at so a long quiet spell does not
+  // age the cursor past CURSOR_MAX_AGE_MS.
+  saveCursor(sink.transport);
 
   const cycleMs = Math.round(performance.now() - cycleT0);
   log.info("poll", { channels: watchedChannels.length, new_messages: cycleNewMessages, ms: cycleMs, via: cycleVia });
@@ -1695,6 +1958,7 @@ export function mcpSink(server: Server): PollSink {
     message_id: `${id}-${Date.now()}`,
   });
   return {
+    transport: "mcp",
     async deliver(channel, msg, content) {
       const preview = content.length > 100 ? content.slice(0, 100) + "…" : content;
       // Sanitize before the content lands in the receiving agent's transcript:
@@ -1794,7 +2058,7 @@ async function main(): Promise<void> {
   // Discover channels — fail hard if this fails
   try {
     watchedChannels = await fetchTextChannels(authHeader);
-    await initializeBaselines(authHeader);
+    await initializeBaselines(authHeader, "mcp");
   } catch (err) {
     log.error("startup", {}, `Initialization failed: ${err}`);
     process.exit(1);
@@ -1929,6 +2193,7 @@ function announceDoorbellAuthFailedOnce(): void {
  * and again after a recovery and a new break.
  */
 export const doorbellSink: PollSink = {
+  transport: "doorbell",
   // Synchronous on purpose: see the delivery loop in pollCycle.
   deliver(channel, msg, content) {
     process.stdout.write(formatDoorbellLine(channel, msg, content) + "\n");
@@ -1960,9 +2225,10 @@ async function runDoorbell(): Promise<void> {
   const authHeader = `Bot ${token}`;
   API_BASE = await resolveApiBase(CONFIGURED_SCREAM_HOLE_URL);
 
+  let resumed = 0;
   try {
     watchedChannels = await fetchTextChannels(authHeader);
-    await initializeBaselines(authHeader);
+    resumed = await initializeBaselines(authHeader, "doorbell");
   } catch (err) {
     log.error("doorbell", {}, `Initialization failed: ${err}`);
     process.exit(1);
@@ -1971,7 +2237,8 @@ async function runDoorbell(): Promise<void> {
   // Diagnostics go to STDERR — stdout is the event stream Monitor consumes, so
   // only doorbell lines may appear there.
   process.stderr.write(
-    `discord-watcher doorbell: watching ${watchedChannels.length} channel(s), poll ${POLL_INTERVAL_MS}ms\n`
+    `discord-watcher doorbell: watching ${watchedChannels.length} channel(s), ` +
+      `${resumed} resumed from the saved cursor, poll ${POLL_INTERVAL_MS}ms\n`
   );
 
   let stopping = false;
