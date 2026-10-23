@@ -148,9 +148,18 @@ rule, so the same rule did different things depending on whether the session
 had `--channels`.
 
 **Known boundary:** each transport keeps its own cursor (see below), so a
-`--channels`→`doorbell` cutover is not bridged. A message that arrives after the
-MCP watcher's last poll and before the doorbell's first start is not delivered
-by the doorbell. Restarts and re-arms within one transport are bridged.
+`--channels`→`doorbell` cutover is not bridged, and it can go either way:
+
+- With no valid doorbell cursor, the doorbell baselines. A message that arrived
+  after the MCP watcher's last poll and before the doorbell's first start is not
+  delivered by the doorbell.
+- With a doorbell cursor younger than `CURSOR_MAX_AGE_MS` (an earlier doorbell
+  session within 4 h), the doorbell resumes from it. It replays everything since
+  that save, including messages the MCP watcher already delivered, because the
+  delivered set lives in memory only.
+
+Replaying is the safer of the two failures. Restarts and re-arms within one
+transport are bridged.
 
 ### Saved poll cursor
 
