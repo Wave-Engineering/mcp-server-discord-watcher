@@ -164,13 +164,34 @@ describe.each(["mcp", "doorbell"] as Mode[])("baseline (#81) — %s mode", (mode
     expect(await runCycle(mode)).toEqual([first.id]);
 
     // Exactly one baseline fetch, then a poll whose cursor is a snowflake for
-    // the moment the baseline was taken.
+    // the moment the baseline was taken, less the 60 s skew/ingest margin.
     expect(requests.filter((u) => u === BASELINE_URL)).toHaveLength(1);
     const cursor = afterCursor(requests[requests.length - 1]);
     expect(cursor).not.toBeNull();
     const cursorMs = snowflakeToMs(cursor!);
-    expect(cursorMs).toBeGreaterThanOrEqual(before);
-    expect(cursorMs).toBeLessThanOrEqual(after);
+    expect(cursorMs).toBeGreaterThanOrEqual(before - 60_000);
+    expect(cursorMs).toBeLessThanOrEqual(after - 60_000);
+  });
+
+  test("empty baseline: a message posted just before the fetch, but not yet visible to it, is still delivered", async () => {
+    // A host clock ahead of Discord's, or scream-hole's ingest lag, can make a
+    // message posted seconds before the baseline invisible to the baseline fetch.
+    // Its snowflake is below "now", so a cursor at exactly "now" loses it.
+    stubFetch((url) => {
+      if (url === BASELINE_URL) return jsonResponse([]);
+      throw new Error(`unexpected request ${url}`);
+    });
+    const before = Date.now();
+    expect(await runCycle(mode)).toEqual([]);
+
+    const late = makeMsg(snowflakeAt(before - 5_000), "@cerberus posted 5 s before the baseline");
+    stubFetch((url) => {
+      const c = afterCursor(url);
+      if (c === null) throw new Error(`unexpected request ${url}`);
+      // Honour `after=`: return the message only if it is newer than the cursor.
+      return jsonResponse(BigInt(late.id) > BigInt(c) ? [late] : []);
+    });
+    expect(await runCycle(mode)).toEqual([late.id]);
   });
 
   test("non-empty baseline: seeds at the newest message and never replays it", async () => {

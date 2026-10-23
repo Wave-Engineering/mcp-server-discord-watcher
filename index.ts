@@ -1145,6 +1145,9 @@ async function fetchTextChannels(authHeader: string): Promise<DiscordChannel[]> 
   return (result.data as DiscordChannel[]).filter((c) => c.type === 0);
 }
 
+/** How far behind "now" an empty channel's cursor starts. See baselineChannel. */
+const BASELINE_EMPTY_MARGIN_MS = 60_000;
+
 /**
  * Seed a channel's cursor so later polls deliver only what arrives after it.
  * The ONE baseline path — startup (initializeBaselines), channel refresh, the
@@ -1154,12 +1157,17 @@ async function fetchTextChannels(authHeader: string): Promise<DiscordChannel[]> 
  * On an OK fetch:
  *   - one or more messages → cursor at the newest, and every returned message
  *     is marked delivered: it is the boundary and must never be replayed.
- *   - NO messages → cursor at a snowflake for "now". Without this the channel
- *     stays un-baselined, the baseline fetch re-runs every cycle, and the first
- *     message ever to arrive becomes the baseline and is swallowed (#81). Through
- *     scream-hole any channel quiet for 4h comes back empty (recentMessageUrl).
- *     The timestamp is taken BEFORE the fetch, so a message that lands while the
- *     fetch is in flight is still newer than the cursor and gets delivered.
+ *   - NO messages → cursor at a snowflake for "now" minus BASELINE_EMPTY_MARGIN_MS.
+ *     Without this the channel stays un-baselined, the baseline fetch re-runs
+ *     every cycle, and the first message ever to arrive becomes the baseline and
+ *     is swallowed (#81). Through scream-hole any channel quiet for 4h comes back
+ *     empty (recentMessageUrl).
+ *     The margin covers what "now" cannot promise: a host clock ahead of
+ *     Discord's, and scream-hole's ingest lag. A message posted just before the
+ *     fetch but not yet visible to it would otherwise sit below the cursor and be
+ *     lost. Anything the margin admits is a message the empty fetch never
+ *     returned, so delivering it is correct, not a replay; deliveredMessageIds
+ *     still guards duplicates.
  *
  * A non-OK fetch leaves the channel un-baselined, so the next cycle retries;
  * a 429 is logged (apiGet has already engaged the kill switch). Throws only if
@@ -1169,7 +1177,7 @@ async function baselineChannel(
   channel: DiscordChannel,
   authHeader: string
 ): Promise<void> {
-  const asOf = Date.now();
+  const asOf = Date.now() - BASELINE_EMPTY_MARGIN_MS;
   const result = await apiGet(recentMessageUrl(channel.id), authHeader);
   if (!result.ok) {
     if (result.status === 429 && result.retryAfter) {
