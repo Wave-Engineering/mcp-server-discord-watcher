@@ -88,10 +88,12 @@ reaches the agent. The `doorbell` subcommand is the alternate transport:
 discord-watcher doorbell
 ```
 
-It runs the **same** poll loop and **same** fail-closed delivery gate
-(`shouldDeliverMessage`, identity resolution, channel allowlist) as the MCP
-watcher, but emits each deliverable message as **one line on stdout** instead of
-an MCP notification:
+It runs the **same** poll core as the MCP watcher — one `pollCycle` with a
+different sink — so the fail-closed delivery gate (`shouldDeliverMessage`,
+identity resolution, channel allowlist), voice-memo transcription and forward
+routing are identical in both modes. The only difference is where the output
+goes: each deliverable message is **one line on stdout** instead of an MCP
+notification:
 
 ```
 [doorbell] #<channel> channel_id=<id> msg_id=<id> from <author>: <preview>
@@ -119,13 +121,30 @@ Properties:
 - **Cold-start, no replay.** On startup the cursor is seeded to the latest message
   per channel; pre-existing history is never re-delivered — identical to the MCP
   watcher's baseline behavior.
+- **Never silently deaf.** Problems go to **stderr**, never stdout (stdout carries
+  only doorbell lines). An unresolved identity prints one
+  `discord-watcher doorbell: identity unresolved …` line naming the files it
+  looked for — once per outage, after the same startup grace as the MCP
+  notification, and again if identity resolves and later breaks. A rejected bot
+  token prints one `auth failed (401)` line.
+- **Voice memos.** An audio attachment is transcribed and the line's preview
+  starts with `[voice memo from <author>: "<text>"]`, as in MCP mode.
+
+**Forward rules apply in both modes.** A forward rule
+(`discord-watcher forward <target>`) routes the same way whichever transport the
+agent uses, with the same precedence: a `//directmsg` addressed to the local
+agent is always delivered locally, a matching message is forwarded to the target
+instead of printing a line, and an excluded, looping or unmatched message prints
+a line as usual. If the forward fails in a way that means the target never got
+it (a transient fetch error or a failed delivery), the message falls back to a
+local doorbell line, so it is never lost. Before #82 doorbell mode ignored the
+rule, so the same rule did different things depending on whether the session
+had `--channels`.
 
 **Known boundary:** the cursor is per-process and seeded at startup. A message
 that arrives in the exact instant of a `--channels`→`doorbell` cutover (after the
 MCP watcher's last poll but before the `doorbell` process seeds) is not bridged.
-This matches the MCP watcher's own cold-start semantics. Forward-rule routing
-(`discord-watcher forward`) is intentionally **not** applied in `doorbell` mode —
-it always delivers the local agent's own doorbells.
+This matches the MCP watcher's own cold-start semantics.
 
 ## Configuration
 

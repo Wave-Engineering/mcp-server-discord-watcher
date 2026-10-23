@@ -1420,41 +1420,11 @@ export async function refreshChannelList(authHeader: string): Promise<void> {
   log.info("state_change", { what: "channels", to: "refreshed", channels: fresh.length });
 }
 
-// One-time MCP notification flag for auth failure. The notification is sent
-// once per process so a Claude session is alerted exactly once that the
-// watcher has stopped delivering messages due to a bad token. Reset on
-// process restart (module re-import) — paired with clearAuthFailed() in main().
+// One-time MCP notification flag for auth failure (see mcpSink.authFailed). The
+// notification is sent once per process so a Claude session is alerted exactly
+// once that the watcher has stopped delivering messages due to a bad token.
+// Reset on process restart (module re-import) — paired with clearAuthFailed().
 let authFailureNotificationSent = false;
-
-/**
- * Emit a one-time MCP notification informing the Claude session that the
- * watcher has hit an auth failure and polling is suspended. Idempotent —
- * subsequent calls in the same process are no-ops.
- */
-async function emitAuthFailedNotificationIfNeeded(server: Server): Promise<void> {
-  if (authFailureNotificationSent) return;
-  authFailureNotificationSent = true;
-  try {
-    await server.notification({
-      method: "notifications/claude/channel" as any,
-      params: {
-        content:
-          "[discord-watcher] AUTH FAILURE: Discord returned 401 Unauthorized. " +
-          "The bot token is expired or revoked. Notification polling is " +
-          "suspended until the operator updates ~/secrets/discord-bot-token " +
-          "(or DISCORD_BOT_TOKEN env var) and restarts the watcher.",
-        meta: {
-          channel_name: "system",
-          channel_id: "auth-failure",
-          author: "discord-watcher",
-          message_id: `auth-failure-${Date.now()}`,
-        },
-      },
-    });
-  } catch (err) {
-    log.error("state_change", { what: "auth", to: "notification_failed" }, String(err));
-  }
-}
 
 // Live breaker state for the unresolved-identity episode (#28). Unlike the auth
 // sentinel this is in-process only: identity self-heals, so the state must not
@@ -1468,13 +1438,13 @@ export function __resetIdentityBreakerForTests(): void {
 
 /**
  * Observe the resolved/unresolved identity state for this poll cycle and make
- * an outage audible: one MCP notification per episode, a throttled warn log
- * while it persists, and an info log on recovery.
+ * an outage audible: one sink alert per episode, a throttled warn log while it
+ * persists, and an info log on recovery. Both transports run this (#82).
  *
  * Delivery semantics are untouched — shouldDeliverMessage still fails closed.
  * This is purely the missing signal.
  */
-export async function reportIdentityState(server: Server): Promise<void> {
+async function reportIdentity(sink: PollSink): Promise<void> {
   const resolved = Boolean(cachedIdentity.devName && cachedIdentity.devTeam);
   const step = stepIdentityBreaker(
     identityBreaker,
@@ -1511,29 +1481,11 @@ export async function reportIdentityState(server: Server): Promise<void> {
 
   if (step.notify) {
     try {
-      await server.notification({
-        method: "notifications/claude/channel" as any,
-        params: {
-          content:
-            "[discord-watcher] IDENTITY UNRESOLVED: no agent identity found, so " +
-            "NO Discord messages will be delivered to this session (delivery " +
-            "fails closed). Looked for:\n" +
-            `  ${paths.durableFile}\n` +
-            `  ${paths.legacyTmpFile}\n` +
-            "Run /name to write the identity file. Delivery resumes " +
-            "automatically within one poll cycle — no restart needed.",
-          meta: {
-            channel_name: "system",
-            channel_id: "identity-unresolved",
-            author: "discord-watcher",
-            message_id: `identity-unresolved-${Date.now()}`,
-          },
-        },
-      });
+      await sink.identityUnresolved(paths);
     } catch (err) {
-      // The episode's one notification did NOT reach the session. Un-latch so
-      // the next cycle retries, rather than letting a transport hiccup consume
-      // the only alert for an outage that may last days.
+      // The episode's one alert did NOT reach the session. Un-latch so the next
+      // cycle retries, rather than letting a transport hiccup consume the only
+      // alert for an outage that may last days.
       identityBreaker = { ...identityBreaker, notified: false };
       log.error(
         "state_change",
@@ -1544,32 +1496,59 @@ export async function reportIdentityState(server: Server): Promise<void> {
   }
 }
 
-export async function checkForNewMessages(
-  server: Server,
-  authHeader: string
-): Promise<void> {
-  // Check kill switch before polling
+/** MCP-mode identity report. Kept as the tested entry point for #28's wiring. */
+export async function reportIdentityState(server: Server): Promise<void> {
+  await reportIdentity(mcpSink(server));
+}
+
+// --- Poll core (#82) ---------------------------------------------------------
+//
+// ONE poll cycle for both transports. The MCP watcher and the doorbell used to
+// carry two copies of this loop, and they drifted: the doorbell never reported
+// an unresolved identity (silently deaf, defeating #28) and never transcribed
+// voice memos. The two modes now differ only in their PollSink.
+//
+// Forward/directmsg routing (#68/#69) runs in the core, not a sink, so a forward
+// rule behaves the same whichever transport the agent uses. The deliver-router
+// is transport-independent, and directmsg > forward > fanout plus the fallback
+// to local delivery on a failed forward keep an addressed message from being lost.
+
+/** Where a poll cycle's output goes. The two transports differ only here. */
+export interface PollSink {
+  /** One addressed, locally-routed message; `content` has any transcription prepended. */
+  deliver(channel: DiscordChannel, msg: DiscordMessage, content: string): Promise<void>;
+  /** The identity breaker fired (once per episode). A throw re-arms it for next cycle. */
+  identityUnresolved(paths: ReturnType<typeof identityPaths>): Promise<void>;
+  /** The auth breaker is engaged. Called every cycle that sees it; the sink latches. */
+  authFailed(): Promise<void>;
+}
+
+/**
+ * One poll pass: kill switch and auth breaker, identity refresh and report,
+ * forward-rule refresh, then per channel (with jitter) baseline-or-fetch, cursor
+ * advance, scope check, dedup, the delivery gate, routing and transcription,
+ * and finally the cycle log.
+ */
+export async function pollCycle(authHeader: string, sink: PollSink): Promise<void> {
   if (checkKillSwitch() === "active") return;
 
-  // Check auth-failure circuit breaker. If the bot token has been revoked
-  // or expired, polling is permanently suspended for this process. Emit a
-  // one-time MCP notification so the Claude session knows why notifications
-  // have stopped, then short-circuit every subsequent cycle silently.
+  // A revoked or expired token suspends polling for this process; the sink
+  // announces it once, then every later cycle short-circuits silently.
   if (checkAuthFailed()) {
-    await emitAuthFailedNotificationIfNeeded(server);
+    await sink.authFailed();
     return;
   }
 
   // Re-resolve identity each cycle: the agent may pick/re-roll its name after
-  // the server starts, and the durable identity file can appear post-boot.
+  // the process starts, and the durable identity file can appear post-boot.
   // refreshIdentity() updates the cache AND logs the transition (the null-at-boot
-  // self-heal) — the channel already re-resolved every cycle; this adds the log.
+  // self-heal).
   refreshIdentity();
 
   // Fail LOUD on unresolved identity (#28). Delivery still fails closed below —
   // this only makes the silence observable, so a wiped identity file surfaces as
   // an event instead of a quiet multi-day outage.
-  await reportIdentityState(server);
+  await reportIdentity(sink);
 
   // Re-read the forward rule each cycle (#68) — installable/removable at runtime
   // without a watcher restart, same live-read lifecycle as the identity file.
@@ -1616,7 +1595,7 @@ export async function checkForNewMessages(
         continue;
       }
 
-      // Push a wake-up notification for each new message (oldest first)
+      // Deliver each new message, oldest first
       for (const msg of messages.reverse()) {
         // Dedup: skip messages we've already delivered (guards against
         // upstream cache bugs returning stale messages)
@@ -1630,64 +1609,7 @@ export async function checkForNewMessages(
 
         markDelivered(msg.id);
         cycleNewMessages++;
-
-        // --- notify-step routing (disc forward #68 + //directmsg #69) -------
-        // Precedence: directmsg > forward > fanout (see decideNotifyRoute). A
-        // //directmsg addressed to the local agent overrides an active forward
-        // rule and falls through to the local notify path below — the red-phone
-        // that makes forward safe (it is NEVER forwarded away). Otherwise the
-        // #68 forward decision is unchanged: an active rule reroutes a matching
-        // doorbell to the target; an excluded / loop / no-rule case notifies
-        // locally. With NO forward rule this is byte-for-byte today's behavior.
-        if (decideNotifyRoute(msg, channel, cachedForwardRule, cachedIdentity) === "forward") {
-          // Never throws — a failed fetch/delivery is logged and swallowed so
-          // the poll loop can never crash on a forward (fire-and-forget).
-          const outcome = await forwardMessage(cachedForwardRule!, channel, msg, authHeader, {
-            fetchMessage: fetchMessageById,
-            log,
-          });
-          // Successfully delivered, or dropped as a positively-identified
-          // deletion (gone) / unexpected
-          // exception → do NOT notify the local agent. Two cases fall through to
-          // the local notify path below — the same path a non-forwarded
-          // addressed message takes — rather than lose the message: a TRANSIENT
-          // fetch error (#44), and a FAILED delivery (#46, router reported
-          // ok:false). In both the message provably did not reach the target.
-          if (!shouldFallbackToLocalNotify(outcome)) {
-            continue;
-          }
-        }
-
-        // Transcribe audio attachments if present
-        const audioTranscription = await transcribeAudioAttachments(msg, authHeader);
-        const fullContent = audioTranscription
-          ? audioTranscription + (msg.content.trim() ? "\n" + msg.content : "")
-          : msg.content;
-
-        const preview =
-          fullContent.length > 100
-            ? fullContent.slice(0, 100) + "…"
-            : fullContent;
-
-        log.info("poll", { channel: channel.name, author: msg.author.username });
-
-        // Sanitize before the content lands in the receiving agent's transcript:
-        // a lone surrogate in a pulled username/preview would 400 its next request.
-        const safeAuthor = sanitizeSurrogates(msg.author.username);
-        const safePreview = sanitizeSurrogates(preview);
-
-        await server.notification({
-          method: "notifications/claude/channel" as any,
-          params: {
-            content: `New message from ${safeAuthor} in #${channel.name}: ${safePreview}`,
-            meta: {
-              channel_name: channel.name,
-              channel_id: channel.id,
-              author: safeAuthor,
-              message_id: msg.id,
-            },
-          },
-        });
+        await routeAndDeliver(channel, msg, authHeader, sink);
       }
     } catch (err) {
       log.error("poll", { channel: channel.name }, String(err));
@@ -1695,17 +1617,114 @@ export async function checkForNewMessages(
 
     // If a 401 was caught mid-cycle (apiGet engaged the auth-failure
     // circuit breaker), break out of the channel loop immediately rather
-    // than continue firing 401s for every remaining channel. Emit the
-    // one-time MCP notification on the way out so the Claude session is
-    // alerted within this cycle, not the next one.
+    // than continue firing 401s for every remaining channel. Announce on the
+    // way out so the session is alerted within this cycle, not the next one.
     if (checkAuthFailed()) {
-      await emitAuthFailedNotificationIfNeeded(server);
+      await sink.authFailed();
       break;
     }
   }
 
   const cycleMs = Math.round(performance.now() - cycleT0);
   log.info("poll", { channels: watchedChannels.length, new_messages: cycleNewMessages, ms: cycleMs, via: cycleVia });
+}
+
+/**
+ * The notify step for one message that passed the delivery gate. Precedence is
+ * directmsg > forward > fanout (decideNotifyRoute): a //directmsg to the local
+ * agent is never forwarded away — the red-phone that makes forward safe. With
+ * no forward rule this is a plain local delivery.
+ */
+async function routeAndDeliver(
+  channel: DiscordChannel,
+  msg: DiscordMessage,
+  authHeader: string,
+  sink: PollSink
+): Promise<void> {
+  if (decideNotifyRoute(msg, channel, cachedForwardRule, cachedIdentity) === "forward") {
+    // Never throws: a failed fetch/delivery is logged and swallowed.
+    const outcome = await forwardMessage(cachedForwardRule!, channel, msg, authHeader, {
+      fetchMessage: fetchMessageById,
+      log,
+    });
+    // Forwarded, gone, or an unknown-state exception → no local delivery. A
+    // TRANSIENT fetch error (#44) or a FAILED delivery (#46) provably did not
+    // reach the target, so it falls through to local delivery, never lost.
+    if (!shouldFallbackToLocalNotify(outcome)) return;
+  }
+
+  const transcription = await transcribeAudioAttachments(msg, authHeader);
+  const content = transcription
+    ? transcription + (msg.content.trim() ? "\n" + msg.content : "")
+    : msg.content;
+
+  log.info("poll", { channel: channel.name, author: msg.author.username });
+  await sink.deliver(channel, msg, content);
+}
+
+/** MCP sink: `notifications/claude/channel` pushes into the session. */
+export function mcpSink(server: Server): PollSink {
+  const notify = (content: string, meta: Record<string, string>) =>
+    server.notification({
+      method: "notifications/claude/channel" as any,
+      params: { content, meta },
+    });
+  const system = (id: string) => ({
+    channel_name: "system",
+    channel_id: id,
+    author: "discord-watcher",
+    message_id: `${id}-${Date.now()}`,
+  });
+  return {
+    async deliver(channel, msg, content) {
+      const preview = content.length > 100 ? content.slice(0, 100) + "…" : content;
+      // Sanitize before the content lands in the receiving agent's transcript:
+      // a lone surrogate in a pulled username/preview would 400 its next request.
+      const safeAuthor = sanitizeSurrogates(msg.author.username);
+      const safePreview = sanitizeSurrogates(preview);
+      await notify(`New message from ${safeAuthor} in #${channel.name}: ${safePreview}`, {
+        channel_name: channel.name,
+        channel_id: channel.id,
+        author: safeAuthor,
+        message_id: msg.id,
+      });
+    },
+    async identityUnresolved(paths) {
+      await notify(
+        "[discord-watcher] IDENTITY UNRESOLVED: no agent identity found, so " +
+          "NO Discord messages will be delivered to this session (delivery " +
+          "fails closed). Looked for:\n" +
+          `  ${paths.durableFile}\n` +
+          `  ${paths.legacyTmpFile}\n` +
+          "Run /name to write the identity file. Delivery resumes " +
+          "automatically within one poll cycle — no restart needed.",
+        system("identity-unresolved")
+      );
+    },
+    async authFailed() {
+      if (authFailureNotificationSent) return;
+      authFailureNotificationSent = true;
+      try {
+        await notify(
+          "[discord-watcher] AUTH FAILURE: Discord returned 401 Unauthorized. " +
+            "The bot token is expired or revoked. Notification polling is " +
+            "suspended until the operator updates ~/secrets/discord-bot-token " +
+            "(or DISCORD_BOT_TOKEN env var) and restarts the watcher.",
+          system("auth-failure")
+        );
+      } catch (err) {
+        log.error("state_change", { what: "auth", to: "notification_failed" }, String(err));
+      }
+    },
+  };
+}
+
+/** MCP-mode poll cycle. */
+export async function checkForNewMessages(
+  server: Server,
+  authHeader: string
+): Promise<void> {
+  await pollCycle(authHeader, mcpSink(server));
 }
 
 // --- Main --------------------------------------------------------------------
@@ -1805,10 +1824,10 @@ async function main(): Promise<void> {
 // --- `doorbell` stdout transport (channels-free doorbell) --------------------
 //
 // Alternate delivery sink for sessions where Claude Code's `--channels` flag is
-// unavailable (e.g. locked-down client environments). Runs the SAME poll and
-// fail-closed delivery gate as the MCP watcher, but emits each deliverable
-// message as one line on STDOUT instead of an MCP `notifications/claude/channel`
-// push (index.ts:1645). Designed to be armed via Claude Code's `Monitor`:
+// unavailable (e.g. locked-down client environments). Runs the SAME poll core
+// (pollCycle) as the MCP watcher with a different sink: each deliverable message
+// is one line on STDOUT, and identity/auth alerts are one-time STDERR lines.
+// Designed to be armed via Claude Code's `Monitor`:
 //
 //   Monitor({ command: "discord-watcher doorbell", persistent: true })
 //
@@ -1823,10 +1842,8 @@ async function main(): Promise<void> {
 // emitted — emitting unfiltered traffic would wake the model per-message, the
 // exact fleet inference storm that rate-limited the shared quota.
 //
-// Intentionally does NOT reuse checkForNewMessages(): that path is coupled to an
-// MCP `server` and runs forward-rule routing (#68), which would send this
-// agent's own doorbells AWAY to another session. Doorbell mode always delivers
-// locally; forward-awareness is a deliberate follow-up (out of scope, #72).
+// A forward rule (#68) applies here exactly as in MCP mode (#82): the poll core
+// routes before the sink sees anything. See the "Poll core" comment above.
 
 const DOORBELL_USAGE =
   [
@@ -1840,22 +1857,26 @@ const DOORBELL_USAGE =
     "Each emitted line has the form:",
     "  [doorbell] #<channel> channel_id=<id> msg_id=<id> from <author>: <preview>",
     "",
-    "On such a line, disc_read the channel_id and respond. Honors the same",
-    "identity gate, channel allowlist, and fail-closed delivery as --channels.",
+    "On such a line, disc_read the channel_id and respond. Runs the same poll",
+    "core as --channels: identity gate, channel allowlist, fail-closed delivery,",
+    "voice-memo transcription and forward rule. An unresolved identity or a",
+    "rejected token is reported once on stderr.",
   ].join("\n") + "\n";
 
 /**
  * Render the single stdout line for a deliverable message. Pure (no I/O) so the
- * line contract is unit-testable. Newlines are collapsed to a single space: a
- * multi-line preview would split into multiple Monitor events (or a malformed
- * one) — one physical line == one doorbell.
+ * line contract is unit-testable. `content` defaults to the message text; the
+ * poll core passes it with any voice-memo transcription prepended. Newlines are
+ * collapsed to a single space: a multi-line preview would split into multiple
+ * Monitor events (or a malformed one) — one physical line == one doorbell.
  */
 export function formatDoorbellLine(
   channel: DiscordChannel,
-  msg: DiscordMessage
+  msg: DiscordMessage,
+  content: string = msg.content ?? ""
 ): string {
   const oneLine = (s: string): string => s.replace(/[\r\n]+/g, " ").trim();
-  const raw = oneLine(msg.content ?? "");
+  const raw = oneLine(content);
   const clipped = raw.length > 100 ? raw.slice(0, 100) + "…" : raw;
   const author = oneLine(sanitizeSurrogates(msg.author.username));
   const preview = sanitizeSurrogates(clipped);
@@ -1863,9 +1884,8 @@ export function formatDoorbellLine(
   return `[doorbell] #${chan} channel_id=${channel.id} msg_id=${msg.id} from ${author}: ${preview}`;
 }
 
-function emitDoorbell(channel: DiscordChannel, msg: DiscordMessage): void {
-  process.stdout.write(formatDoorbellLine(channel, msg) + "\n");
-}
+/** Prefix of the doorbell's one-per-episode unresolved-identity stderr line. */
+export const DOORBELL_IDENTITY_LINE_PREFIX = "discord-watcher doorbell: identity unresolved";
 
 // Auth-failure announcement latch. The doorbell has no MCP notification channel,
 // so a revoked/expired token is surfaced as a ONE-TIME stderr line instead (the
@@ -1884,72 +1904,31 @@ function announceDoorbellAuthFailedOnce(): void {
 }
 
 /**
- * One poll pass: fetch new messages per channel and emit those that pass the
- * shared delivery gate. Mirrors the MCP watcher's poll body (index.ts:1540) —
- * including its kill-switch, auth-breaker, and inter-channel jitter gates — but
- * with a stdout sink and no forward/server coupling.
+ * Doorbell sink: deliveries are stdout lines (the Monitor event stream), and
+ * identity/auth alerts are stderr lines, so stdout only ever carries doorbells.
+ * The identity line follows the shared breaker: once per unresolved episode,
+ * and again after a recovery and a new break.
  */
-export async function doorbellCycle(authHeader: string): Promise<void> {
-  // Kill switch (operator pause / 429 backoff) and auth-failure breaker gate the
-  // cycle exactly as the MCP path does (index.ts:1506/1513). Without them a
-  // persistent doorbell would ignore an operator pause and, on a revoked token,
-  // spin and log-spam 401s every cycle while going silently deaf (#28).
-  if (checkKillSwitch() === "active") return;
-  if (checkAuthFailed()) {
+export const doorbellSink: PollSink = {
+  async deliver(channel, msg, content) {
+    process.stdout.write(formatDoorbellLine(channel, msg, content) + "\n");
+  },
+  async identityUnresolved(paths) {
+    process.stderr.write(
+      `${DOORBELL_IDENTITY_LINE_PREFIX} — no agent identity found, so NO ` +
+        "Discord messages will be delivered (delivery fails closed). Looked for " +
+        `${paths.durableFile} and ${paths.legacyTmpFile}. Run /name; delivery ` +
+        "resumes within one poll cycle, no restart needed.\n"
+    );
+  },
+  async authFailed() {
     announceDoorbellAuthFailedOnce();
-    return;
-  }
+  },
+};
 
-  // Keep identity fresh each cycle — shouldDeliverMessage fails CLOSED on an
-  // unresolved identity, so a wiped identity file makes us MISS, never storm.
-  refreshIdentity();
-
-  let isFirstChannel = true;
-  for (const channel of watchedChannels) {
-    // Inter-channel jitter — spread outbound calls so a many-channel guild does
-    // not fire a tight burst that trips the global rate limit (matches the MCP
-    // watcher, index.ts:1546). Skipped on the first channel (no preceding work).
-    if (!isFirstChannel) await sleep(nextChannelJitterMs());
-    isFirstChannel = false;
-
-    try {
-      const lastId = lastSeenMessageId.get(channel.id);
-
-      // Un-baselined channel (e.g. one added by refreshChannelList mid-run): seed
-      // the cursor only, never replay pre-existing history.
-      if (!lastId) {
-        await baselineChannel(channel, authHeader);
-        continue;
-      }
-
-      const messages = await fetchAllNewMessages(channel.id, lastId, authHeader);
-      if (messages.length === 0) continue;
-
-      // Advance cursor to newest (messages are newest-first); dedup via
-      // deliveredMessageIds guards the boundary. Matches index.ts:1575.
-      lastSeenMessageId.set(channel.id, messages[0].id);
-
-      // Deliver-scope: poll every channel, emit only from allowlisted ones.
-      if (!isChannelInScope(channel, CHANNEL_ALLOWLIST)) continue;
-
-      for (const msg of messages.reverse()) {
-        if (deliveredMessageIds.has(msg.id)) continue;
-        if (!shouldDeliverMessage(msg, cachedIdentity, { verbose: VERBOSE })) continue;
-        markDelivered(msg.id);
-        emitDoorbell(channel, msg);
-      }
-    } catch (err) {
-      // A transient fetch error on one channel must never kill the loop.
-      log.error("doorbell", { channel: channel.name }, String(err));
-    }
-
-    // A 401 that engaged the breaker mid-cycle — stop hammering 401 for the
-    // remaining channels this cycle and surface the outage once (index.ts:1667).
-    if (checkAuthFailed()) {
-      announceDoorbellAuthFailedOnce();
-      break;
-    }
-  }
+/** Doorbell-mode poll cycle. */
+export async function doorbellCycle(authHeader: string): Promise<void> {
+  await pollCycle(authHeader, doorbellSink);
 }
 
 /** Foreground doorbell transport. Does not return until SIGINT/SIGTERM. */
