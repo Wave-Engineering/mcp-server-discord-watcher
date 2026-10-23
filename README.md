@@ -51,16 +51,20 @@ cd mcp-server-discord-watcher
 
 The watcher connects to Discord's REST API and polls all text channels on the
 configured guild at 15-second intervals. When a new message arrives that is
-addressed to the agent (via `@all`, `@<dev-team>`, or `@<dev-name>`), it sends
+addressed to the agent (via `@agents`, `@<dev-team>`, or `@<dev-name>`), it sends
 an MCP notification to the Claude Code session.
 
 ### Message Filtering
 
 - **Self-echo filtering** -- Messages containing the agent's own signature
   (`-- **<dev-name>**`) are skipped to prevent echo loops.
-- **Targeted routing** -- Only messages addressed to `@all`, `@<dev-team>`, or
+- **Targeted routing** -- Only messages addressed to `@agents`, `@<dev-team>`, or
   `@<dev-name>` are delivered. Set `DISCORD_WATCHER_VERBOSE=1` to bypass
   filtering and receive all messages.
+- **`@agents` is the fleet broadcast; `@all` is being retired** -- On Mattermost,
+  `@all` pages every human in a channel, so the fleet broadcasts with `@agents` on
+  every backend. During the transition the watcher still hears `@all`; set
+  `DISCORD_WATCHER_ACCEPT_ALL=0` to stop hearing it. Send `@agents`.
 - **Channel scoping (deliver-layer)** -- The watcher always polls every text
   channel in the guild (required so channel injection works), but only
   *delivers* wake-ups from channels in its **allowlist**. Set the allowlist via
@@ -197,8 +201,8 @@ Two operational notes:
   end-to-end (a real `@<dev-team>` post in an in-scope channel wakes the team; a
   post in an out-of-scope channel does not) -- config-exists is not
   config-works.
-- **`@all` is channel-scoped under deliver-scoping.** Because out-of-scope
-  channels are never delivered, `@all` reaches only agents whose allowlist
+- **`@agents` (and `@all`) is channel-scoped under deliver-scoping.** Because out-of-scope
+  channels are never delivered, a broadcast reaches only agents whose allowlist
   includes the channel the message was posted in. A true cross-team broadcast
   must be posted in a channel present in *every* team's allowlist (a shared
   broadcast channel).

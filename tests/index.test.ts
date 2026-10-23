@@ -28,6 +28,7 @@ import {
   ensureApiV10Suffix,
   resolveApiBase,
   shouldDeliverMessage,
+  ACCEPT_ALL,
   isReplyToOurSignature,
   nextChannelJitterMs,
   refreshChannelList,
@@ -1112,6 +1113,37 @@ describe("shouldDeliverMessage", () => {
   test("delivers message addressed to @all", () => {
     const msg = makeMsg({ content: "@all standup in 5" });
     expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
+  // #84: `@agents` is the fleet broadcast; `@all` is heard during the transition.
+  test("delivers message addressed to @agents", () => {
+    const msg = makeMsg({ content: "@agents standup in 5" });
+    expect(shouldDeliverMessage(msg, identity())).toBe(true);
+  });
+
+  test("@agents survives punctuation, like @all", () => {
+    for (const content of ["@agents, standup", "(@agents) standup", "standup @agents."]) {
+      expect(shouldDeliverMessage(makeMsg({ content }), identity())).toBe(true);
+    }
+  });
+
+  test("near-misses of @agents do not deliver", () => {
+    for (const content of ["@agentsx standup", "agents standup", "@agent standup"]) {
+      expect(shouldDeliverMessage(makeMsg({ content }), identity())).toBe(false);
+    }
+  });
+
+  test("@all is accepted by default, and refused with acceptAll: false", () => {
+    expect(ACCEPT_ALL).toBe(true); // DISCORD_WATCHER_ACCEPT_ALL unset in the test lane
+    const msg = makeMsg({ content: "@all standup" });
+    expect(shouldDeliverMessage(msg, identity(), { acceptAll: false })).toBe(false);
+    const agents = makeMsg({ content: "@agents standup" });
+    expect(shouldDeliverMessage(agents, identity(), { acceptAll: false })).toBe(true);
+  });
+
+  test("FAIL CLOSED: drops even @agents when identity is unresolved", () => {
+    const msg = makeMsg({ content: "@agents standup" });
+    expect(shouldDeliverMessage(msg, identity({ devTeam: null }))).toBe(false);
   });
 
   test("addressing matches even with trailing punctuation", () => {

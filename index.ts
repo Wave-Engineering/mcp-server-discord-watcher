@@ -243,6 +243,10 @@ const POLL_INTERVAL_MS = 15_000;
 const CHANNEL_REFRESH_MS = 5 * 60_000;
 const MESSAGES_PER_PAGE = 50;
 const VERBOSE = process.env.DISCORD_WATCHER_VERBOSE === "1";
+// `@agents` is the fleet broadcast (#84). `@all` is still heard during the transition;
+// DISCORD_WATCHER_ACCEPT_ALL=0 stops hearing it without a code change. On Mattermost
+// `@all` pages every human in a channel, so the fleet moves off it on both backends.
+export const ACCEPT_ALL = process.env.DISCORD_WATCHER_ACCEPT_ALL !== "0";
 
 // Random delay between per-channel polls within a single cycle. Spreads
 // outbound Discord API calls across the cycle window so guilds with many
@@ -936,15 +940,16 @@ export function isReplyToOurSignature(
  *   3. Identity unresolved (no devName, no devTeam) → drop (fail closed,
  *      prevents cross-project leakage to unattributed sessions)
  *   4. VERBOSE mode bypasses targeted routing → deliver
- *   5. Addressed via @all, @<dev-team>, @<dev-name>, or reply to a message
- *      we signed → deliver
+ *   5. Addressed via @agents (or @all while acceptAll), @<dev-team>, @<dev-name>,
+ *      or reply to a message we signed → deliver
  *   6. Otherwise → drop
  */
 export function shouldDeliverMessage(
   msg: DiscordMessage,
   identity: AgentIdentity,
-  options: { verbose?: boolean } = {}
+  options: { verbose?: boolean; acceptAll?: boolean } = {}
 ): boolean {
+  const acceptAll = options.acceptAll ?? ACCEPT_ALL;
   // 1. Skip empty messages (e.g. bot embeds, sticker-only)
   if (!msg.content.trim() && !msg.attachments?.length) {
     return false;
@@ -977,7 +982,8 @@ export function shouldDeliverMessage(
     .toLowerCase()
     .split(/\s+/)
     .map(stripTokenPunctuation);
-  const isAddressedToAll = tokens.includes("@all");
+  const isAddressedToAll =
+    tokens.includes("@agents") || (acceptAll && tokens.includes("@all"));
   const isAddressedToTeam = identity.devTeam
     ? tokens.includes(`@${identity.devTeam.toLowerCase()}`)
     : false;
@@ -1744,7 +1750,7 @@ export async function checkForNewMessages(
 
 const INSTRUCTIONS = [
   'Discord messages arrive as <channel source="discord_watcher" channel_name="..." channel_id="..." author="...">.',
-  "Messages are pre-filtered: you only receive messages addressed to @all, @<Dev-Team>, @<Dev-Name>, or replies to messages you signed.",
+  "Messages are pre-filtered: you only receive messages addressed to @agents (the fleet broadcast; @all is still accepted during the transition), @<Dev-Team>, @<Dev-Name>, or replies to messages you signed. To broadcast to the fleet, write @agents.",
   "When you see a notification:",
   "1. Call the mcp__disc-server__disc_read tool with channel_id and limit: 10 to fetch recent messages in context.",
   "2. Process the message and respond by calling mcp__disc-server__disc_send if action is needed.",
