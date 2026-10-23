@@ -1750,7 +1750,7 @@ export async function checkForNewMessages(
 
 const INSTRUCTIONS = [
   'Discord messages arrive as <channel source="discord_watcher" channel_name="..." channel_id="..." author="...">.',
-  "Messages are pre-filtered: you only receive messages addressed to @agents (the fleet broadcast; @all is still accepted during the transition), @<Dev-Team>, @<Dev-Name>, or replies to messages you signed. To broadcast to the fleet, write @agents.",
+  `Messages are pre-filtered: you only receive messages addressed to @agents (the fleet broadcast${ACCEPT_ALL ? "; @all is still accepted during the transition" : ""}), @<Dev-Team>, @<Dev-Name>, or replies to messages you signed. To broadcast to the fleet, write @agents.`,
   "When you see a notification:",
   "1. Call the mcp__disc-server__disc_read tool with channel_id and limit: 10 to fetch recent messages in context.",
   "2. Process the message and respond by calling mcp__disc-server__disc_send if action is needed.",
