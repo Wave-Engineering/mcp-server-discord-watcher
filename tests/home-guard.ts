@@ -32,3 +32,8 @@ if (!home || !realpathSync(home).startsWith(tmp + sep)) {
 // ~/.claude/logs/mcp.jsonl, which the HOME override above does not redirect.
 // Drop it before index.ts creates its logger, so test log lines go to stderr only.
 delete process.env.LOG_FILE;
+
+// Same for XDG_STATE_HOME, where the saved poll cursor lives (#83): a session
+// that exports it would put test cursors beside the live watchers' cursors.
+// Unset, the cursor falls back to $HOME/.local/state, inside the throwaway HOME.
+delete process.env.XDG_STATE_HOME;
