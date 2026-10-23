@@ -1515,8 +1515,8 @@ export async function reportIdentityState(server: Server): Promise<void> {
 
 /** Where a poll cycle's output goes. The two transports differ only here. */
 export interface PollSink {
-  /** One addressed, locally-routed message; `content` has any transcription prepended. */
-  deliver(channel: DiscordChannel, msg: DiscordMessage, content: string): Promise<void>;
+  /** One local message, transcription prepended. Sync sinks return nothing: no await between lines. */
+  deliver(channel: DiscordChannel, msg: DiscordMessage, content: string): void | Promise<void>;
   /** The identity breaker fired (once per episode). A throw re-arms it for next cycle. */
   identityUnresolved(paths: ReturnType<typeof identityPaths>): Promise<void>;
   /** The auth breaker is engaged. Called every cycle that sees it; the sink latches. */
@@ -1572,6 +1572,7 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
     }
     isFirstChannel = false;
 
+    const ready: { msg: DiscordMessage; content: string }[] = [];
     try {
       const lastId = lastSeenMessageId.get(channel.id);
 
@@ -1595,7 +1596,8 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
         continue;
       }
 
-      // Deliver each new message, oldest first
+      // Route and transcribe each new message, oldest first: all network work
+      // happens here, before anything is delivered.
       for (const msg of messages.reverse()) {
         // Dedup: skip messages we've already delivered (guards against
         // upstream cache bugs returning stale messages)
@@ -1609,7 +1611,20 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
 
         markDelivered(msg.id);
         cycleNewMessages++;
-        await routeAndDeliver(channel, msg, authHeader, sink);
+        const content = await prepareLocalDelivery(channel, msg, authHeader);
+        if (content !== null) ready.push({ msg, content });
+      }
+    } catch (err) {
+      log.error("poll", { channel: channel.name }, String(err));
+    }
+
+    // Deliver back to back, no network call in between: doorbell-oneshot kills
+    // the watcher soon after the first line, and every later message is already
+    // marked delivered. Runs even if preparing a later message threw.
+    try {
+      for (const { msg, content } of ready) {
+        const pending = sink.deliver(channel, msg, content);
+        if (pending) await pending;
       }
     } catch (err) {
       log.error("poll", { channel: channel.name }, String(err));
@@ -1630,17 +1645,17 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
 }
 
 /**
- * The notify step for one message that passed the delivery gate. Precedence is
- * directmsg > forward > fanout (decideNotifyRoute): a //directmsg to the local
- * agent is never forwarded away — the red-phone that makes forward safe. With
- * no forward rule this is a plain local delivery.
+ * The notify step for one message that passed the delivery gate: returns the
+ * content to deliver locally, or null if the message went to the forward
+ * target. Precedence is directmsg > forward > fanout (decideNotifyRoute): a
+ * //directmsg to the local agent is never forwarded away — the red-phone that
+ * makes forward safe. With no forward rule every message is delivered locally.
  */
-async function routeAndDeliver(
+async function prepareLocalDelivery(
   channel: DiscordChannel,
   msg: DiscordMessage,
-  authHeader: string,
-  sink: PollSink
-): Promise<void> {
+  authHeader: string
+): Promise<string | null> {
   if (decideNotifyRoute(msg, channel, cachedForwardRule, cachedIdentity) === "forward") {
     // Never throws: a failed fetch/delivery is logged and swallowed.
     const outcome = await forwardMessage(cachedForwardRule!, channel, msg, authHeader, {
@@ -1650,16 +1665,14 @@ async function routeAndDeliver(
     // Forwarded, gone, or an unknown-state exception → no local delivery. A
     // TRANSIENT fetch error (#44) or a FAILED delivery (#46) provably did not
     // reach the target, so it falls through to local delivery, never lost.
-    if (!shouldFallbackToLocalNotify(outcome)) return;
+    if (!shouldFallbackToLocalNotify(outcome)) return null;
   }
 
   const transcription = await transcribeAudioAttachments(msg, authHeader);
-  const content = transcription
+  log.info("poll", { channel: channel.name, author: msg.author.username });
+  return transcription
     ? transcription + (msg.content.trim() ? "\n" + msg.content : "")
     : msg.content;
-
-  log.info("poll", { channel: channel.name, author: msg.author.username });
-  await sink.deliver(channel, msg, content);
 }
 
 /** MCP sink: `notifications/claude/channel` pushes into the session. */
@@ -1889,7 +1902,7 @@ export const DOORBELL_IDENTITY_LINE_PREFIX = "discord-watcher doorbell: identity
 
 // Auth-failure announcement latch. The doorbell has no MCP notification channel,
 // so a revoked/expired token is surfaced as a ONE-TIME stderr line instead (the
-// MCP path uses emitAuthFailedNotificationIfNeeded). This latch is fresh module
+// MCP path uses mcpSink(...).authFailed). This latch is fresh module
 // state per process, so a restart yields exactly one new announcement — separate
 // from clearAuthFailed() in runDoorbell, which re-arms the breaker sentinel.
 let doorbellAuthAnnounced = false;
@@ -1910,7 +1923,8 @@ function announceDoorbellAuthFailedOnce(): void {
  * and again after a recovery and a new break.
  */
 export const doorbellSink: PollSink = {
-  async deliver(channel, msg, content) {
+  // Synchronous on purpose: see the delivery loop in pollCycle.
+  deliver(channel, msg, content) {
     process.stdout.write(formatDoorbellLine(channel, msg, content) + "\n");
   },
   async identityUnresolved(paths) {

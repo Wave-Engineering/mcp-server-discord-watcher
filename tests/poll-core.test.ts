@@ -80,7 +80,8 @@ function jsonResponse(data: unknown, status = 200): Response {
  * against `posted` and return newest-first (as Discord does) plus any `stale`
  * messages (scream-hole has returned already-seen messages before), fetch-by-id
  * serves `byId`, and the CDN and STT endpoints serve a voice memo saying
- * `transcript`.
+ * `transcript`. The routing-time calls (fetch-by-id, CDN, STT) take `slowMs`
+ * and append `net:<kind>` to `events` when they answer.
  */
 function fakeDiscord(state: {
   posted: DiscordMessage[];
@@ -88,7 +89,14 @@ function fakeDiscord(state: {
   byId?: Record<string, Response>;
   transcript?: string;
   sttCalls?: string[];
+  slowMs?: number;
+  events?: string[];
 }): void {
+  const slow = async (kind: string, res: Response): Promise<Response> => {
+    if (state.slowMs) await Bun.sleep(state.slowMs);
+    state.events?.push(`net:${kind}`);
+    return res;
+  };
   globalThis.fetch = mock(async (input: string | URL | Request) => {
     const url = String(input);
     if (url === BASELINE_URL) return jsonResponse([]);
@@ -100,12 +108,15 @@ function fakeDiscord(state: {
     }
     if (url.startsWith(FETCH_BY_ID_PREFIX)) {
       const id = url.slice(FETCH_BY_ID_PREFIX.length);
-      return state.byId?.[id] ?? jsonResponse({ message: "Unknown Message", code: 10008 }, 404);
+      return slow(
+        "fetch-by-id",
+        state.byId?.[id] ?? jsonResponse({ message: "Unknown Message", code: 10008 }, 404)
+      );
     }
-    if (url === AUDIO_URL) return new Response(new ArrayBuffer(64), { status: 200 });
+    if (url === AUDIO_URL) return slow("audio", new Response(new ArrayBuffer(64), { status: 200 }));
     if (url.includes("audio/transcriptions")) {
       state.sttCalls?.push(url);
-      return jsonResponse({ text: state.transcript ?? "" });
+      return slow("stt", jsonResponse({ text: state.transcript ?? "" }));
     }
     throw new Error(`unexpected request ${url}`);
   }) as any;
@@ -120,8 +131,11 @@ interface CycleOutput {
   identityAlerts: number;
 }
 
-/** One poll cycle in either transport, reading what reached the session. */
-async function runCycle(mode: Mode): Promise<CycleOutput> {
+/**
+ * One poll cycle in either transport, reading what reached the session. In
+ * doorbell mode each stdout line is also appended to `events` as `line:<id>`.
+ */
+async function runCycle(mode: Mode, events?: string[]): Promise<CycleOutput> {
   const out: CycleOutput = { delivered: [], texts: [], identityAlerts: 0 };
   const originalErr = process.stderr.write.bind(process.stderr);
   process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
@@ -148,19 +162,24 @@ async function runCycle(mode: Mode): Promise<CycleOutput> {
     }
     const originalOut = process.stdout.write.bind(process.stdout);
     const stdoutLines: string[] = [];
-    process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    const stray: string[] = [];
+    process.stdout.write = ((chunk: string | Uint8Array) => {
       const text = String(chunk);
       if (text.startsWith("[doorbell] ")) {
         stdoutLines.push(text);
-        return true;
+        events?.push(`line:${text.match(/ msg_id=(\S+) /)![1]}`);
+      } else {
+        stray.push(text);
       }
-      return (originalOut as (...a: unknown[]) => boolean)(chunk, ...rest);
+      return true;
     }) as typeof process.stdout.write;
     try {
       await doorbellCycle(AUTH);
     } finally {
       process.stdout.write = originalOut;
     }
+    // stdout is the Monitor event stream: nothing but doorbell lines, ever.
+    expect(stray).toEqual([]);
     for (const line of stdoutLines) {
       out.delivered.push(line.match(/ msg_id=(\S+) /)![1]);
       out.texts.push(line);
@@ -360,5 +379,64 @@ describe.each(MODES)("forward rule (#68/#69, #82) — %s mode", (mode) => {
     const msg = makeMsg("@cerberus no rule now");
     state.posted.push(msg);
     expect((await runCycle(mode)).delivered).toEqual([msg.id]);
+  });
+});
+
+// doorbell-oneshot (cc-workflow scripts/doorbell-oneshot.sh) drains for ~0.2 s
+// after the FIRST doorbell line, then kills the watcher. Every message in a
+// cycle is already marked delivered with the cursor past it, so a line that has
+// not been written by then is lost for good, and the re-armed doorbell re-seeds
+// past it. A channel's lines must therefore go out back to back: all forwarding
+// and transcription first, then the writes with no network call between them.
+describe("doorbell lines for one channel are written back to back (#82)", () => {
+  let dropDir: string;
+
+  beforeEach(() => {
+    dropDir = mkdtempSync(join(tmpdir(), "dw-burst-82-"));
+    // carol's traffic stays local (the #68 exclude list); bj's is forwarded.
+    writeForwardRule(
+      { target: { label: "grunt-82", dir: dropDir }, exclude: ["carol"] },
+      forwardRulePath()
+    );
+  });
+
+  afterEach(() => {
+    rmSync(dropDir, { recursive: true, force: true });
+  });
+
+  test("a slow forward and a slow transcription both finish before the first line", async () => {
+    const events: string[] = [];
+    const state = {
+      posted: [] as DiscordMessage[],
+      byId: {} as Record<string, Response>,
+      transcript: "on my way",
+      slowMs: 300,
+      events,
+    };
+    fakeDiscord(state);
+    await runCycle("doorbell", events); // baseline
+
+    const carol = { author: { id: "user-carol", username: "carol" } };
+    const redPhone = makeMsg("//dm @cerberus parked, need you"); // local: directmsg
+    const handled = makeMsg("@cerberus please handle this");     // forwarded (slow fetch)
+    const plain = makeMsg("@cerberus plain local", carol);        // local: excluded author
+    const memo = { ...voiceMemo("@cerberus"), ...carol };         // local, slow STT
+    const last = makeMsg("@cerberus last one", carol);            // local: excluded author
+    state.posted.push(redPhone, handled, plain, memo, last);
+    state.byId[handled.id] = jsonResponse(handled);
+
+    const out = await runCycle("doorbell", events);
+
+    expect(out.delivered).toEqual([redPhone.id, plain.id, memo.id, last.id]);
+    expect(readdirSync(join(dropDir, DROP_SUBDIR))).toHaveLength(1);
+    // Every network answer precedes every line: no line waits on the network
+    // once the first one is out.
+    const firstLine = events.findIndex((e) => e.startsWith("line:"));
+    expect(events.slice(0, firstLine).filter((e) => e.startsWith("net:"))).toEqual([
+      "net:fetch-by-id",
+      "net:audio",
+      "net:stt",
+    ]);
+    expect(events.slice(firstLine)).toEqual(out.delivered.map((id) => `line:${id}`));
   });
 });
