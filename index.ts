@@ -2043,7 +2043,7 @@ async function main(): Promise<void> {
   API_BASE = await resolveApiBase(CONFIGURED_SCREAM_HOLE_URL);
 
   const server = new Server(
-    { name: "discord_watcher", version: "1.6.1" },
+    { name: "discord_watcher", version: "1.7.0" },
     {
       capabilities: {
         experimental: { "claude/channel": {} },
@@ -2065,7 +2065,7 @@ async function main(): Promise<void> {
   }
 
   log.info("startup", {
-    version: "1.6.1",
+    version: "1.7.0",
     config: {
       guild_id: GUILD_ID,
       channels: watchedChannels.length,
