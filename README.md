@@ -147,9 +147,10 @@ local doorbell line, so it is never lost. Before #82 doorbell mode ignored the
 rule, so the same rule did different things depending on whether the session
 had `--channels`.
 
-**Cutover:** both modes read and write the same cursor file for one identity and
-guild, so a `--channels`→`doorbell` cutover within the cursor's max age picks up
-where the MCP watcher's last poll left off.
+**Known boundary:** each transport keeps its own cursor (see below), so a
+`--channels`→`doorbell` cutover is not bridged. A message that arrives after the
+MCP watcher's last poll and before the doorbell's first start is not delivered
+by the doorbell. Restarts and re-arms within one transport are bridged.
 
 ### Saved poll cursor
 
@@ -158,28 +159,42 @@ doorbell (for example under `doorbell-oneshot.sh`, which starts a fresh
 `doorbell` for every batch) delivers the messages that arrived while it was
 down, instead of skipping them.
 
-- **Where.** `${XDG_STATE_HOME:-$HOME/.local/state}/discord-watcher/cursor-<guild>-<dev_team>-<dev_name>.json`,
-  one file per guild and agent identity. It holds
-  `{ "version": 1, "saved_at", "api_base", "guild_id", "dev_team", "dev_name", "channels": { "<channel_id>": "<message_id>" } }`.
+- **Where.** `${XDG_STATE_HOME:-$HOME/.local/state}/discord-watcher/cursor-<guild>-<dev_team>-<dev_name>-<mcp|doorbell>.json`,
+  one file per guild, agent identity and transport. It holds
+  `{ "version": 1, "saved_at", "api_base", "guild_id", "dev_team", "dev_name", "transport", "channels": { "<channel_id>": "<message_id>" } }`.
   An agent whose identity is unresolved neither loads nor saves a cursor.
+- **Why one file per transport.** The MCP watcher is installed at user scope, so
+  it also runs in sessions without `--channels`, the very sessions the doorbell
+  is for. There its notifications reach nobody but still succeed, so it moves
+  its cursor past every addressed message. If the doorbell shared that file, a
+  re-arm would resume from the MCP watcher's position and skip what the doorbell
+  never printed.
 - **When it is saved.** Right after each channel's messages are delivered, and
   once at the end of every poll cycle. The write goes to a temp file in the same
   directory and is renamed into place, so it is never read half-written. A
   channel's entry only moves past messages that were delivered, filtered out or
-  forwarded. If a channel's pass fails, its entry stays where it was.
+  forwarded.
 - **Max age: 4 hours** (`CURSOR_MAX_AGE_MS`, scream-hole's cache window). At
-  startup a younger cursor is resumed. An older, unreadable or wrong-identity one
-  is ignored with one `cursor` log line, and every channel is baselined as before.
+  startup a younger cursor is resumed. An older, unreadable, wrong-identity or
+  wrong-transport one is ignored with one `cursor` log line, and every channel is
+  baselined as before.
   A channel the cursor does not list is baselined too. Quiet cycles still rewrite
   the file, so a long quiet spell does not age it out.
 - **Direct vs scream-hole.** A cursor is a Discord message id, and scream-hole
   serves the same ids, so a cursor saved in one mode is resumed in the other.
 - **Duplicate window.** The set of already-delivered ids is not saved, so a
   restart can re-deliver what was delivered between the last save and the stop.
-  In doorbell mode there is no such gap: a channel's lines and its save run with
-  nothing in between, so a SIGTERM always finds every printed line saved. In MCP
-  mode the gap is the notification round trip. A failed delivery is never saved
-  past, so it is re-delivered after a restart.
+  In MCP mode that gap is the notification round trip.
+- **Doorbell guarantee.** A channel's lines and its save run with nothing in
+  between, so a SIGTERM always finds every line *written* to stdout saved, and
+  nothing not yet written. Written is not read: a consumer must read stdout to
+  EOF after stopping the watcher, or a line still in the pipe is lost with its
+  cursor already saved. (cc-workflow#1284 makes `doorbell-oneshot.sh` do so.)
+- **Failed delivery.** If a channel's pass fails (a thrown transcription or
+  forward, or an MCP notification that throws), its saved entry stays where it
+  was, so a restart *before that channel's next message* re-delivers the
+  messages. The running process has already moved past them, though, so the
+  channel's next good pass saves past them for good.
 
 **Known limit:** two live sessions with the same Dev-Name in one checkout share
 one cursor file (cc-workflow triage #16, identity collision). The last writer

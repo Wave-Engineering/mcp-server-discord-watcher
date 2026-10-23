@@ -203,16 +203,26 @@ function setIdentity(identity: AgentIdentity | null): void {
   refreshIdentity();
 }
 
+/**
+ * The transport the test is driving: restart() starts that mode, and cpath() /
+ * readCursor() name its file. Each transport keeps its own cursor.
+ */
+let transport: Mode = "doorbell";
+
+function cpath(identity: AgentIdentity, mode: Mode = transport): string {
+  return cursorPath(identity, mode)!;
+}
+
 /** What a new process sees: fresh poll state, then startup. */
-async function restart(): Promise<number> {
+async function restart(mode: Mode = transport): Promise<number> {
   __resetPollStateForTests(CHANNELS);
   __resetIdentityBreakerForTests();
   refreshIdentity();
-  return initializeBaselines(AUTH);
+  return initializeBaselines(AUTH, mode);
 }
 
-function readCursor(identity: AgentIdentity = CERBERUS): CursorFile {
-  return JSON.parse(readFileSync(cursorPath(identity)!, "utf-8"));
+function readCursor(identity: AgentIdentity = CERBERUS, mode: Mode = transport): CursorFile {
+  return JSON.parse(readFileSync(cpath(identity, mode), "utf-8"));
 }
 
 beforeEach(() => {
@@ -229,6 +239,7 @@ beforeEach(() => {
   process.env.XDG_STATE_HOME = stateHome;
   setIdentity(CERBERUS);
   captureCursorLogs();
+  transport = "doorbell";
 });
 
 afterEach(() => {
@@ -246,33 +257,42 @@ afterEach(() => {
 });
 
 describe("cursor file location (#83)", () => {
-  test("per guild and identity, under XDG_STATE_HOME, falling back to ~/.local/state", () => {
-    expect(cursorPath(CERBERUS, "g1")).toBe(
-      join(stateHome, "discord-watcher", "cursor-g1-oaw-cerberus.json")
+  test("per guild, identity and transport, under XDG_STATE_HOME, falling back to ~/.local/state", () => {
+    expect(cursorPath(CERBERUS, "doorbell", "g1")).toBe(
+      join(stateHome, "discord-watcher", "cursor-g1-oaw-cerberus-doorbell.json")
     );
-    expect(cursorPath(CERBERUS, "g2")).not.toBe(cursorPath(CERBERUS, "g1"));
-    expect(cursorPath(HYDRA, "g1")).not.toBe(cursorPath(CERBERUS, "g1"));
+    expect(cursorPath(CERBERUS, "mcp", "g1")).toBe(
+      join(stateHome, "discord-watcher", "cursor-g1-oaw-cerberus-mcp.json")
+    );
+    expect(cursorPath(CERBERUS, "doorbell", "g2")).not.toBe(cursorPath(CERBERUS, "doorbell", "g1"));
+    expect(cursorPath(HYDRA, "doorbell", "g1")).not.toBe(cursorPath(CERBERUS, "doorbell", "g1"));
 
     delete process.env.XDG_STATE_HOME;
-    expect(cursorPath(CERBERUS, "g1")).toBe(
-      join(process.env.HOME!, ".local", "state", "discord-watcher", "cursor-g1-oaw-cerberus.json")
+    expect(cursorPath(CERBERUS, "doorbell", "g1")).toBe(
+      join(process.env.HOME!, ".local", "state", "discord-watcher", "cursor-g1-oaw-cerberus-doorbell.json")
     );
     process.env.XDG_STATE_HOME = "relative/state"; // the XDG spec says ignore it
-    expect(cursorPath(CERBERUS, "g1")!.startsWith(join(process.env.HOME!, ".local", "state"))).toBe(true);
+    expect(
+      cursorPath(CERBERUS, "doorbell", "g1")!.startsWith(join(process.env.HOME!, ".local", "state"))
+    ).toBe(true);
   });
 
   test("an identity cannot escape the state directory through its name", () => {
-    const path = cursorPath({ devName: "../../evil", devTeam: "a/b" }, "g1")!;
+    const path = cursorPath({ devName: "../../evil", devTeam: "a/b" }, "doorbell", "g1")!;
     expect(dirname(path)).toBe(join(stateHome, "discord-watcher"));
   });
 
   test("an unresolved identity has no cursor file", () => {
-    expect(cursorPath({ devName: null, devTeam: "oaw" })).toBeNull();
-    expect(cursorPath({ devName: "cerberus", devTeam: null })).toBeNull();
+    expect(cursorPath({ devName: null, devTeam: "oaw" }, "doorbell")).toBeNull();
+    expect(cursorPath({ devName: "cerberus", devTeam: null }, "mcp")).toBeNull();
   });
 });
 
 describe.each(MODES)("restart resumes from the saved cursor (#83) — %s mode", (mode) => {
+  beforeEach(() => {
+    transport = mode;
+  });
+
   test("messages that arrived while the watcher was down are delivered after the restart", async () => {
     const state = fakeDiscord();
     state.posted[CHAN_A.id].push(makeMsg("history, before the first start"));
@@ -302,7 +322,7 @@ describe.each(MODES)("restart resumes from the saved cursor (#83) — %s mode", 
     const state = fakeDiscord();
     await restart();
     await runCycle(mode);
-    rmSync(cursorPath(CERBERUS)!);
+    rmSync(cpath(CERBERUS));
 
     state.posted[CHAN_A.id].push(makeMsg("@cerberus while you were out"));
     await restart();
@@ -315,7 +335,7 @@ describe.each(MODES)("restart resumes from the saved cursor (#83) — %s mode", 
     await runCycle(mode);
     const saved = readCursor();
     delete saved.channels[CHAN_B.id];
-    writeFileSync(cursorPath(CERBERUS)!, JSON.stringify(saved));
+    writeFileSync(cpath(CERBERUS), JSON.stringify(saved));
 
     const missedA = makeMsg("@cerberus resumed channel");
     const missedB = makeMsg("@cerberus baselined channel");
@@ -359,7 +379,7 @@ describe("doorbell-oneshot re-arm (#83)", () => {
         printed.push(id);
         if (printed.length === 1) {
           setTimeout(() => {
-            atKill = readFileSync(cursorPath(CERBERUS)!, "utf-8");
+            atKill = readFileSync(cpath(CERBERUS), "utf-8");
             printedBeforeKill = [...printed];
           }, 0);
         }
@@ -372,7 +392,7 @@ describe("doorbell-oneshot re-arm (#83)", () => {
 
     // The process died there: the file is what it was at the kill. Re-arm, with
     // one more message having arrived in between.
-    writeFileSync(cursorPath(CERBERUS)!, atKill!);
+    writeFileSync(cpath(CERBERUS), atKill!);
     const a3 = makeMsg("@cerberus arrived while re-arming");
     state.posted[CHAN_A.id].push(a3);
     await restart();
@@ -403,8 +423,58 @@ describe("doorbell-oneshot re-arm (#83)", () => {
   });
 });
 
+// The MCP watcher is installed at user scope, so it runs in EVERY session,
+// including the no-`--channels` ones the doorbell is for. There its
+// notifications go to a sink nobody reads and still succeed, so it commits every
+// addressed message. If it shared the doorbell's file, a re-arm would resume from
+// the MCP watcher's position and skip exactly what #83 is meant to deliver.
+describe("each transport keeps its own cursor (#83)", () => {
+  test("an MCP watcher advancing and saving does not move the doorbell's resume point", async () => {
+    const state = fakeDiscord();
+    // The doorbell arms and saves, then is down between batches.
+    await restart("doorbell");
+    expect(await runCycle("doorbell")).toEqual([]);
+    const doorbellFile = readFileSync(cpath(CERBERUS, "doorbell"), "utf-8");
+
+    // The session's MCP watcher runs on, into a sink no one reads.
+    await restart("mcp");
+    expect(await runCycle("mcp")).toEqual([]);
+    const m1 = makeMsg("@cerberus first, during the gap");
+    const m2 = makeMsg("@oaw second, during the gap");
+    state.posted[CHAN_A.id].push(m1);
+    state.posted[CHAN_B.id].push(m2);
+    expect(await runCycle("mcp")).toEqual([m1.id, m2.id]); // "delivered", unread
+    expect(readCursor(CERBERUS, "mcp")).toMatchObject({
+      transport: "mcp",
+      channels: { [CHAN_A.id]: m1.id, [CHAN_B.id]: m2.id },
+    });
+    expect(readFileSync(cpath(CERBERUS, "doorbell"), "utf-8")).toBe(doorbellFile);
+
+    // The doorbell re-arms from its own file and delivers both.
+    expect(await restart("doorbell")).toBe(2);
+    expect(await runCycle("doorbell")).toEqual([m1.id, m2.id]);
+  });
+
+  test("a file saved by the other transport is ignored with one log line", async () => {
+    const state = fakeDiscord();
+    await restart("mcp");
+    await runCycle("mcp");
+    mkdirSync(dirname(cpath(CERBERUS, "doorbell")), { recursive: true });
+    writeFileSync(cpath(CERBERUS, "doorbell"), readFileSync(cpath(CERBERUS, "mcp"), "utf-8"));
+    state.posted[CHAN_A.id].push(makeMsg("@cerberus not via the mcp cursor"));
+
+    cursorLogs.length = 0;
+    expect(await restart("doorbell")).toBe(0);
+    expect(await runCycle("doorbell")).toEqual([]);
+    expect(cursorLogs.filter((l) => l.action === "ignored")).toEqual([
+      expect.objectContaining({ reason: "wrong transport", transport: "mcp" }),
+    ]);
+  });
+});
+
 describe("a failed delivery keeps the channel's previous entry (#83)", () => {
   test("MCP notifications that throw are not committed, so a restart delivers them", async () => {
+    transport = "mcp";
     const state = fakeDiscord();
     await restart();
     await runCycle("mcp");
@@ -418,9 +488,32 @@ describe("a failed delivery keeps the channel's previous entry (#83)", () => {
     await restart();
     expect(await runCycle("mcp")).toEqual([msg.id]);
   });
+
+  test("the hold-back lasts only until the channel's next good pass (the documented limit)", async () => {
+    transport = "mcp";
+    const state = fakeDiscord();
+    await restart();
+    await runCycle("mcp");
+
+    const lost = makeMsg("@cerberus notify fails for this one");
+    state.posted[CHAN_A.id].push(lost);
+    expect(await runCycle("mcp", { failNotify: true })).toEqual([]);
+    // In-process the cursor already moved past `lost`, so the next good pass
+    // commits past it too, and a restart after that does not bring it back.
+    const next = makeMsg("@cerberus next one");
+    state.posted[CHAN_A.id].push(next);
+    expect(await runCycle("mcp")).toEqual([next.id]);
+    expect(readCursor().channels[CHAN_A.id]).toBe(next.id);
+    await restart();
+    expect(await runCycle("mcp")).toEqual([]);
+  });
 });
 
 describe.each(MODES)("unusable cursor falls back to the baseline (#83) — %s mode", (mode) => {
+  beforeEach(() => {
+    transport = mode;
+  });
+
   async function savedThenDown(state: FakeState): Promise<DiscordMessage> {
     await restart();
     await runCycle(mode);
@@ -434,7 +527,7 @@ describe.each(MODES)("unusable cursor falls back to the baseline (#83) — %s mo
     await savedThenDown(state);
     const saved = readCursor();
     saved.saved_at = Date.now() - CURSOR_MAX_AGE_MS - 1000;
-    writeFileSync(cursorPath(CERBERUS)!, JSON.stringify(saved));
+    writeFileSync(cpath(CERBERUS), JSON.stringify(saved));
 
     cursorLogs.length = 0;
     state.requests.length = 0;
@@ -451,7 +544,7 @@ describe.each(MODES)("unusable cursor falls back to the baseline (#83) — %s mo
     const missed = await savedThenDown(state);
     const saved = readCursor();
     saved.saved_at = Date.now() - CURSOR_MAX_AGE_MS + 60_000;
-    writeFileSync(cursorPath(CERBERUS)!, JSON.stringify(saved));
+    writeFileSync(cpath(CERBERUS), JSON.stringify(saved));
     expect(await restart()).toBe(2);
     expect(await runCycle(mode)).toEqual([missed.id]);
   });
@@ -467,7 +560,7 @@ describe.each(MODES)("unusable cursor falls back to the baseline (#83) — %s mo
     await savedThenDown(state);
     const content =
       typeof corrupt === "string" ? corrupt : JSON.stringify(corrupt(readCursor()));
-    writeFileSync(cursorPath(CERBERUS)!, content);
+    writeFileSync(cpath(CERBERUS), content);
 
     cursorLogs.length = 0;
     expect(await restart()).toBe(0);
@@ -483,7 +576,7 @@ describe("two identities (#83)", () => {
     const state = fakeDiscord();
     await restart();
     await runCycle("doorbell");
-    const cerberusFile = readFileSync(cursorPath(CERBERUS)!, "utf-8");
+    const cerberusFile = readFileSync(cpath(CERBERUS), "utf-8");
 
     // A message for hydra arrives; hydra starts with no cursor of its own.
     setIdentity(HYDRA);
@@ -492,7 +585,7 @@ describe("two identities (#83)", () => {
     expect(await restart()).toBe(0); // cerberus's file is not hydra's
     expect(await runCycle("doorbell")).toEqual([]);
     expect(readCursor(HYDRA).dev_name).toBe("hydra");
-    expect(readFileSync(cursorPath(CERBERUS)!, "utf-8")).toBe(cerberusFile);
+    expect(readFileSync(cpath(CERBERUS), "utf-8")).toBe(cerberusFile);
 
     // Back to cerberus: it resumes from its own file, unchanged by hydra.
     setIdentity(CERBERUS);
@@ -509,8 +602,8 @@ describe("two identities (#83)", () => {
     await runCycle("doorbell");
     // Put hydra's cursor where cerberus's belongs (a name collision, or a copy).
     setIdentity(CERBERUS);
-    mkdirSync(dirname(cursorPath(CERBERUS)!), { recursive: true });
-    writeFileSync(cursorPath(CERBERUS)!, readFileSync(cursorPath(HYDRA)!, "utf-8"));
+    mkdirSync(dirname(cpath(CERBERUS)), { recursive: true });
+    writeFileSync(cpath(CERBERUS), readFileSync(cpath(HYDRA), "utf-8"));
     state.posted[CHAN_A.id].push(makeMsg("@cerberus not via hydra's cursor"));
 
     cursorLogs.length = 0;
@@ -525,7 +618,7 @@ describe("two identities (#83)", () => {
     const state = fakeDiscord();
     await restart();
     await runCycle("doorbell");
-    const cerberusFile = readFileSync(cursorPath(CERBERUS)!, "utf-8");
+    const cerberusFile = readFileSync(cpath(CERBERUS), "utf-8");
 
     setIdentity(null);
     state.posted[CHAN_A.id].push(makeMsg("@cerberus deaf"));
@@ -534,10 +627,10 @@ describe("two identities (#83)", () => {
     expect(cursorLogs.filter((l) => l.action === "skipped")).toHaveLength(1);
     for (let i = 0; i < 3; i++) await runCycle("doorbell");
     // Nothing new in the state dir, and cerberus's file is untouched.
-    expect(readdirSync(dirname(cursorPath(CERBERUS)!))).toEqual([
-      "cursor-1486516321385578576-oaw-cerberus.json",
+    expect(readdirSync(dirname(cpath(CERBERUS)))).toEqual([
+      "cursor-1486516321385578576-oaw-cerberus-doorbell.json",
     ]);
-    expect(readFileSync(cursorPath(CERBERUS)!, "utf-8")).toBe(cerberusFile);
+    expect(readFileSync(cpath(CERBERUS), "utf-8")).toBe(cerberusFile);
   });
 });
 
@@ -548,7 +641,7 @@ describe("api_base (#83)", () => {
     await restart();
     await runCycle("doorbell");
     const saved = readCursor();
-    writeFileSync(cursorPath(CERBERUS)!, JSON.stringify({ ...saved, api_base: "scream-hole" }));
+    writeFileSync(cpath(CERBERUS), JSON.stringify({ ...saved, api_base: "scream-hole" }));
     state.posted[CHAN_A.id].push(missed);
 
     cursorLogs.length = 0;
@@ -566,7 +659,7 @@ describe("the cursor write is atomic (#83)", () => {
     const state = fakeDiscord();
     await restart();
     await runCycle("doorbell");
-    const path = cursorPath(CERBERUS)!;
+    const path = cpath(CERBERUS);
     const oldContent = readFileSync(path, "utf-8");
     // Hold the old file open: a reader mid-read keeps its inode, so it can't be reused.
     const reader = openSync(path, "r");
@@ -588,7 +681,7 @@ describe("the cursor write is atomic (#83)", () => {
     const state = fakeDiscord();
     await restart();
     await runCycle("doorbell");
-    const path = cursorPath(CERBERUS)!;
+    const path = cpath(CERBERUS);
     const good = readFileSync(path, "utf-8");
 
     // Block the temp file: if the save wrote the target in place, this would not stop it.
@@ -605,7 +698,7 @@ describe("the cursor write is atomic (#83)", () => {
 
     // Unblocked, the next save lands and says so.
     rmSync(`${path}.${process.pid}.tmp`, { recursive: true });
-    saveCursor();
+    saveCursor("doorbell");
     expect(readCursor().channels[CHAN_A.id]).toBe(m2.id);
     expect(cursorLogs.filter((l) => l.action === "save_recovered")).toHaveLength(1);
   });
@@ -613,9 +706,9 @@ describe("the cursor write is atomic (#83)", () => {
 
 test("the state directory is created on first save, not before", async () => {
   fakeDiscord();
-  const dir = dirname(cursorPath(CERBERUS)!);
+  const dir = dirname(cpath(CERBERUS));
   await restart();
   expect(existsSync(dir)).toBe(false);
   await runCycle("doorbell");
-  expect(existsSync(cursorPath(CERBERUS)!)).toBe(true);
+  expect(existsSync(cpath(CERBERUS))).toBe(true);
 });
