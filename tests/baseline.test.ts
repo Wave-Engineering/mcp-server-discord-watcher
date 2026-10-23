@@ -104,6 +104,8 @@ describe.each(["mcp", "doorbell"] as Mode[])("baseline (#81) — %s mode", (mode
 
   beforeEach(() => {
     originalFetch = globalThis.fetch;
+    // HOME is a throwaway dir (tests/home-guard.ts); give the kill switch a place to land.
+    mkdirSync(`${process.env.HOME}/.claude`, { recursive: true });
     for (const f of [KILL_FILE, AUTH_FAILED_FILE]) {
       try { unlinkSync(f); } catch { /* ignore */ }
     }

@@ -6,7 +6,7 @@
   "main": "index.ts",
   "scripts": {
     "lint": "bunx tsc --noEmit",
-    "test": "bun test",
+    "test": "scripts/ci/test.sh",
     "build": "scripts/ci/build.sh"
   },
   "dependencies": {
