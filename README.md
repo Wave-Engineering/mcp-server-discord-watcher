@@ -189,7 +189,7 @@ down, instead of skipping them.
   between, so a SIGTERM always finds every line *written* to stdout saved, and
   nothing not yet written. Written is not read: a consumer must read stdout to
   EOF after stopping the watcher, or a line still in the pipe is lost with its
-  cursor already saved. (cc-workflow#1284 makes `doorbell-oneshot.sh` do so.)
+  cursor already saved. (cc-workflow#1286 makes `doorbell-oneshot.sh` do so.)
 - **Failed delivery.** If a channel's pass fails (a thrown transcription or
   forward, or an MCP notification that throws), its saved entry stays where it
   was, so a restart *before that channel's next message* re-delivers the
