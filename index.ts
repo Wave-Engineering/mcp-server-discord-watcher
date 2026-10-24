@@ -1087,7 +1087,7 @@ const lastSeenMessageId = new Map<string, string>();
 // Deduplication: track recently delivered message IDs so a message an upstream
 // returns twice is never delivered twice. A guard only: the cursor, not this set,
 // is what keeps a poll from asking for what it already has (#92), so a hit means
-// the upstream replayed something, and is counted. Bounded to prevent unbounded
+// the upstream replayed something; pollCycle counts it and logs it. Bounded to prevent unbounded
 // memory growth — oldest entries evicted via FIFO.
 const DELIVERED_SET_MAX = 500;
 const deliveredMessageIds = new Set<string>();
@@ -1867,6 +1867,8 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
     // a restart that comes first. Rolling back instead would let one poison
     // message stall its channel forever.
     let channelFailed = false;
+    // Messages the upstream returned that this channel had already seen
+    let replayed = 0;
     try {
       const lastId = lastSeenMessageId.get(channel.id);
 
@@ -1876,14 +1878,17 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
         continue;
       }
 
-      // Oldest first, by id (fetchAllNewMessages sorts them)
-      const messages = await fetchAllNewMessages(channel.id, lastId, authHeader);
+      // Oldest first, by id (fetchAllNewMessages sorts them). The fetch asked for
+      // messages after the cursor, so anything at or below it is an upstream's
+      // replay: drop it here, which also keeps the cursor from moving backwards.
+      const cursor = BigInt(lastId);
+      const fetched = await fetchAllNewMessages(channel.id, lastId, authHeader);
+      const messages = fetched.filter((msg) => BigInt(msg.id) > cursor);
+      replayed = fetched.length - messages.length;
       if (messages.length === 0) continue;
 
-      // Advance the cursor to the newest message. Never backwards: a page made
-      // only of replays below the cursor must not re-open what it already passed.
-      const newest = newestId(messages);
-      if (BigInt(newest) > BigInt(lastId)) lastSeenMessageId.set(channel.id, newest);
+      // Advance the cursor to the newest message
+      lastSeenMessageId.set(channel.id, newestId(messages));
 
       // Deliver-layer channel scope (#31): the watcher polls every channel (so
       // injection works), but only DELIVERS from allowlisted channels. Baseline
@@ -1901,6 +1906,7 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
         // upstream returning a message twice)
         if (deliveredMessageIds.has(msg.id)) {
           dedupHits++;
+          replayed++;
           continue;
         }
 
@@ -1916,6 +1922,10 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
     } catch (err) {
       channelFailed = true;
       log.error("poll", { channel: channel.name }, String(err));
+    } finally {
+      // Runs on every `continue` above too. A replay is the upstream's defect,
+      // not ours, but it must not go unseen (#92).
+      if (replayed > 0) log.warn("poll", { channel: channel.name, replayed });
     }
 
     // Deliver back to back, no network call in between: doorbell-oneshot kills

@@ -245,6 +245,33 @@ describe.each(["scream-hole", "discord"] as Shape[])("poll order (#92) — %s sh
     expect(__dedupHitsForTests()).toBe(0);
   });
 
+  test("a replay below the cursor is dropped before dedup, and the cursor holds", async () => {
+    await baseline();
+    const [first, second] = burst(2);
+    posted.push(first);
+    expect(await runCycle("mcp")).toEqual([first.id]);
+
+    // The upstream returns the already-seen `first` alongside the new `second`,
+    // and then `first` alone.
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      const url = String(input);
+      requests.push(url);
+      return jsonResponse(shape === "discord" ? [second, first] : [first, second]);
+    }) as any;
+    expect(await runCycle("mcp")).toEqual([second.id]);
+    globalThis.fetch = mock(async (input: string | URL | Request) => {
+      requests.push(String(input));
+      return jsonResponse([first]);
+    }) as any;
+    expect(await runCycle("mcp")).toEqual([]);
+    // One more poll shows where the replay-only page left the cursor.
+    expect(await runCycle("mcp")).toEqual([]);
+
+    // after=first, then after=second twice: the replay never moved it back.
+    expect(pollCursors(requests).slice(-3)).toEqual([first.id, second.id, second.id]);
+    expect(__dedupHitsForTests()).toBe(0);
+  });
+
   test("a non-empty baseline seeds the cursor at the newest message", async () => {
     // Three messages already in the channel when the watcher starts.
     const old = Array.from({ length: 3 }, (_, i) => {
