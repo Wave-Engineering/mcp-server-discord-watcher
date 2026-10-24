@@ -67,3 +67,42 @@ describe("workflow dependency installs (#56)", () => {
     expect(committed).not.toMatch(/_authToken\s*=\s*\S/);
   });
 });
+
+describe("workflow bun version (#94)", () => {
+  test("every workflow runs the same pinned bun", () => {
+    // An unpinned oven-sh/setup-bun takes the newest bun, so a release run could
+    // test and build with a bun that PR CI never ran. Every setup-bun step must
+    // carry a bun-version, and every pin (`bun-version:` or `bun@<v>`) in every
+    // workflow must be the same version.
+    const files = workflows();
+    expect(files.length).toBeGreaterThan(0);
+
+    const setupSteps: string[] = [];
+    const unpinned: string[] = [];
+    const pins: string[] = [];
+    for (const { name, body } of files) {
+      const lines = body.split("\n");
+      lines.forEach((line, i) => {
+        for (const m of line.matchAll(/\bbun@(\d+\.\d+\.\d+)\b/g)) pins.push(`${name}: ${m[1]}`);
+        if (!/uses:\s*oven-sh\/setup-bun@/.test(line)) return;
+        setupSteps.push(`${name}:${i + 1}`);
+        // The step's own lines are the ones indented past its `- uses:` dash.
+        const indent = line.search(/\S/);
+        let version: string | null = null;
+        for (let j = i + 1; j < lines.length; j++) {
+          const next = lines[j];
+          if (next.trim() === "") continue;
+          if (next.search(/\S/) <= indent) break;
+          const m = next.match(/^\s*bun-version:\s*["']?([^\s"'#]+)/);
+          if (m) version = m[1];
+        }
+        if (version === null) unpinned.push(`${name}:${i + 1}`);
+        else pins.push(`${name}: ${version}`);
+      });
+    }
+    // Denominator first: a suite with no setup-bun steps and no pins asserts nothing.
+    expect(setupSteps.length).toBeGreaterThan(0);
+    expect(unpinned).toEqual([]);
+    expect(new Set(pins.map((p) => p.split(": ")[1])).size).toBe(1);
+  });
+});
