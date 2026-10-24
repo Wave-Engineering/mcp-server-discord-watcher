@@ -67,3 +67,56 @@ describe("workflow dependency installs (#56)", () => {
     expect(committed).not.toMatch(/_authToken\s*=\s*\S/);
   });
 });
+
+describe("workflow bun version (#94)", () => {
+  test("every workflow runs the same pinned bun", () => {
+    // An unpinned bun takes the newest release, so PR CI and a release run could
+    // test and build with different buns. Every place a workflow gets bun is a
+    // pin site: an oven-sh/setup-bun step must carry `bun-version: x.y.z`, and an
+    // `npm install … bun` must name `bun@x.y.z`. All pins must agree.
+    // `bun-version-file:` counts as unpinned: a file reference cannot be compared.
+    const files = workflows();
+    expect(files.length).toBeGreaterThan(0);
+
+    const sites: string[] = [];
+    const unpinned: string[] = [];
+    const pins: string[] = [];
+    const exact = /^\d+\.\d+\.\d+$/;
+    for (const { name, body } of files) {
+      const lines = body.split("\n");
+      const isComment = (l: string): boolean => /^\s*#/.test(l);
+      lines.forEach((line, i) => {
+        if (isComment(line)) return;
+        const where = `${name}:${i + 1}`;
+
+        if (/\bnpm\s+(install|i)\b.*\bbun\b/.test(line)) {
+          sites.push(where);
+          const m = line.match(/\bbun@(\S+)/);
+          if (m && exact.test(m[1])) pins.push(m[1]);
+          else unpinned.push(where);
+        }
+
+        if (!/\buses:\s*["']?oven-sh\/setup-bun@/.test(line)) return;
+        sites.push(where);
+        // The step runs from its `- ` line to the next line indented no deeper
+        // than that dash, so `name:` before `uses:` or `with:` after it is inside.
+        let start = i;
+        while (start > 0 && !/^\s*- /.test(lines[start])) start--;
+        const dash = lines[start].search(/\S/);
+        let version: string | null = null;
+        for (let j = start; j < lines.length; j++) {
+          const l = lines[j];
+          if (j > start && l.trim() !== "" && !isComment(l) && l.search(/\S/) <= dash) break;
+          const m = l.match(/^[\s-]*bun-version:\s*["']?([^\s"'#]+)/);
+          if (m) version = m[1];
+        }
+        if (version !== null && exact.test(version)) pins.push(version);
+        else unpinned.push(where);
+      });
+    }
+    // Denominator first: no bun sites at all would assert nothing.
+    expect(sites.length).toBeGreaterThan(0);
+    expect(unpinned).toEqual([]);
+    expect(new Set(pins).size).toBe(1);
+  });
+});
