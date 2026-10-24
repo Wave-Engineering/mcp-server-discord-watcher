@@ -54,6 +54,11 @@ configured guild at 15-second intervals. When a new message arrives that is
 addressed to the agent (via `@agents`, `@<dev-team>`, or `@<dev-name>`), it sends
 an MCP notification to the Claude Code session.
 
+A poll asks for every message after the channel's cursor and delivers them oldest
+first, by message id, then moves the cursor to the newest. Direct to Discord it
+pages 50 at a time. Through scream-hole it sends no `limit`, because scream-hole
+answers `after` with `limit` by keeping the newest messages and dropping the rest.
+
 ### Message Filtering
 
 - **Self-echo filtering** -- Messages containing the agent's own signature

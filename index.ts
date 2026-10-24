@@ -1084,12 +1084,15 @@ function recentMessageUrl(channelId: string): string {
 let watchedChannels: DiscordChannel[] = [];
 const lastSeenMessageId = new Map<string, string>();
 
-// Deduplication: track recently delivered message IDs so upstream cache bugs
-// (e.g. scream-hole returning already-seen messages) can't cause re-delivery.
-// Bounded to prevent unbounded memory growth — oldest entries evicted via FIFO.
+// Deduplication: track recently delivered message IDs so a message an upstream
+// returns twice is never delivered twice. A guard only: the cursor, not this set,
+// is what keeps a poll from asking for what it already has (#92), so a hit means
+// the upstream replayed something, and is counted. Bounded to prevent unbounded
+// memory growth — oldest entries evicted via FIFO.
 const DELIVERED_SET_MAX = 500;
 const deliveredMessageIds = new Set<string>();
 const deliveredOrder: string[] = [];
+let dedupHits = 0;
 
 function markDelivered(messageId: string): void {
   if (deliveredMessageIds.has(messageId)) return;
@@ -1104,14 +1107,46 @@ function markDelivered(messageId: string): void {
  * Reset for tests — the poll state is process-global otherwise. Sets the
  * watched channels and clears every cursor and the delivered set, so a test can
  * drive checkForNewMessages / doorbellCycle from a known un-baselined start.
+ * `apiBase` selects the transport (a scream-hole base, or direct by default).
  */
-export function __resetPollStateForTests(channels: DiscordChannel[]): void {
+export function __resetPollStateForTests(
+  channels: DiscordChannel[],
+  apiBase: string = DISCORD_API_BASE
+): void {
   watchedChannels = channels;
+  API_BASE = apiBase;
   lastSeenMessageId.clear();
   committedCursor.clear();
   cursorSaveFailing = false;
   deliveredMessageIds.clear();
   deliveredOrder.length = 0;
+  dedupHits = 0;
+}
+
+/** For tests: how many polled messages the dedup set has caught since the reset. */
+export function __dedupHitsForTests(): number {
+  return dedupHits;
+}
+
+/**
+ * The newest message's id, by snowflake value (#92). Never by position: Discord
+ * pages newest-first and scream-hole oldest-first. `messages` must be non-empty.
+ */
+export function newestId(messages: DiscordMessage[]): string {
+  let max = messages[0].id;
+  for (const msg of messages) {
+    if (BigInt(msg.id) > BigInt(max)) max = msg.id;
+  }
+  return max;
+}
+
+/** A copy of `messages`, oldest first by snowflake value, whatever order they came in (#92). */
+export function byIdAscending(messages: DiscordMessage[]): DiscordMessage[] {
+  return [...messages].sort((a, b) => {
+    const x = BigInt(a.id);
+    const y = BigInt(b.id);
+    return x < y ? -1 : x > y ? 1 : 0;
+  });
 }
 
 // --- Persisted cursor (#83) --------------------------------------------------
@@ -1412,7 +1447,7 @@ async function baselineChannel(
   if (messages.length === 0) {
     lastSeenMessageId.set(channel.id, timestampToSnowflake(asOf));
   } else {
-    lastSeenMessageId.set(channel.id, messages[0].id);
+    lastSeenMessageId.set(channel.id, newestId(messages));
     for (const msg of messages) markDelivered(msg.id);
   }
   commitChannel(channel.id);
@@ -1481,11 +1516,18 @@ async function fetchAllNewMessages(
 ): Promise<DiscordMessage[]> {
   const allMessages: DiscordMessage[] = [];
   let cursor = afterId;
+  // scream-hole answers `after`+`limit` with the NEWEST `limit` matches and drops
+  // the older ones, so paging could never reach them (#92). Without `limit` it
+  // returns everything cached after the cursor, bounded by its cache window, in
+  // one response. Discord caps a page, so direct mode still paginates.
+  const viaScreamHole = API_BASE !== DISCORD_API_BASE;
 
   // Paginate to collect all new messages (prevents silent drops on bursts)
   while (true) {
     const result = await apiGet(
-      `/channels/${channelId}/messages?after=${cursor}&limit=${MESSAGES_PER_PAGE}`,
+      viaScreamHole
+        ? `/channels/${channelId}/messages?after=${cursor}`
+        : `/channels/${channelId}/messages?after=${cursor}&limit=${MESSAGES_PER_PAGE}`,
       authHeader
     );
 
@@ -1502,7 +1544,7 @@ async function fetchAllNewMessages(
         // here would cause checkForNewMessages's per-channel catch to log
         // a misleading "Error polling #<channel>" line that looks like a
         // crash, immediately after the "AUTH FAILURE" line we want.
-        return allMessages;
+        return byIdAscending(allMessages);
       }
       throw new Error(`Discord API HTTP ${result.status}`);
     }
@@ -1512,14 +1554,15 @@ async function fetchAllNewMessages(
 
     allMessages.push(...messages);
 
-    // If we got fewer than the limit, we've consumed everything
-    if (messages.length < MESSAGES_PER_PAGE) break;
+    // One unlimited scream-hole response is the whole set; a short Discord page
+    // means the channel is drained.
+    if (viaScreamHole || messages.length < MESSAGES_PER_PAGE) break;
 
-    // Advance cursor to the newest message (messages are newest-first)
-    cursor = messages[0].id;
+    // Page on from the newest message of this page, whatever its order
+    cursor = newestId(messages);
   }
 
-  return allMessages;
+  return byIdAscending(allMessages);
 }
 
 /**
@@ -1833,11 +1876,14 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
         continue;
       }
 
+      // Oldest first, by id (fetchAllNewMessages sorts them)
       const messages = await fetchAllNewMessages(channel.id, lastId, authHeader);
       if (messages.length === 0) continue;
 
-      // Update baseline to the newest message (messages are newest-first)
-      lastSeenMessageId.set(channel.id, messages[0].id);
+      // Advance the cursor to the newest message. Never backwards: a page made
+      // only of replays below the cursor must not re-open what it already passed.
+      const newest = newestId(messages);
+      if (BigInt(newest) > BigInt(lastId)) lastSeenMessageId.set(channel.id, newest);
 
       // Deliver-layer channel scope (#31): the watcher polls every channel (so
       // injection works), but only DELIVERS from allowlisted channels. Baseline
@@ -1850,10 +1896,11 @@ export async function pollCycle(authHeader: string, sink: PollSink): Promise<voi
 
       // Route and transcribe each new message, oldest first: all network work
       // happens here, before anything is delivered.
-      for (const msg of messages.reverse()) {
-        // Dedup: skip messages we've already delivered (guards against
-        // upstream cache bugs returning stale messages)
+      for (const msg of messages) {
+        // Dedup: skip messages we've already delivered (guards against an
+        // upstream returning a message twice)
         if (deliveredMessageIds.has(msg.id)) {
+          dedupHits++;
           continue;
         }
 
