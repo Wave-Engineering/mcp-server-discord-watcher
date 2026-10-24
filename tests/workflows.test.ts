@@ -70,39 +70,53 @@ describe("workflow dependency installs (#56)", () => {
 
 describe("workflow bun version (#94)", () => {
   test("every workflow runs the same pinned bun", () => {
-    // An unpinned oven-sh/setup-bun takes the newest bun, so a release run could
-    // test and build with a bun that PR CI never ran. Every setup-bun step must
-    // carry a bun-version, and every pin (`bun-version:` or `bun@<v>`) in every
-    // workflow must be the same version.
+    // An unpinned bun takes the newest release, so PR CI and a release run could
+    // test and build with different buns. Every place a workflow gets bun is a
+    // pin site: an oven-sh/setup-bun step must carry `bun-version: x.y.z`, and an
+    // `npm install … bun` must name `bun@x.y.z`. All pins must agree.
+    // `bun-version-file:` counts as unpinned: a file reference cannot be compared.
     const files = workflows();
     expect(files.length).toBeGreaterThan(0);
 
-    const setupSteps: string[] = [];
+    const sites: string[] = [];
     const unpinned: string[] = [];
     const pins: string[] = [];
+    const exact = /^\d+\.\d+\.\d+$/;
     for (const { name, body } of files) {
       const lines = body.split("\n");
+      const isComment = (l: string): boolean => /^\s*#/.test(l);
       lines.forEach((line, i) => {
-        for (const m of line.matchAll(/\bbun@(\d+\.\d+\.\d+)\b/g)) pins.push(`${name}: ${m[1]}`);
-        if (!/uses:\s*oven-sh\/setup-bun@/.test(line)) return;
-        setupSteps.push(`${name}:${i + 1}`);
-        // The step's own lines are the ones indented past its `- uses:` dash.
-        const indent = line.search(/\S/);
+        if (isComment(line)) return;
+        const where = `${name}:${i + 1}`;
+
+        if (/\bnpm\s+(install|i)\b.*\bbun\b/.test(line)) {
+          sites.push(where);
+          const m = line.match(/\bbun@(\S+)/);
+          if (m && exact.test(m[1])) pins.push(m[1]);
+          else unpinned.push(where);
+        }
+
+        if (!/\buses:\s*["']?oven-sh\/setup-bun@/.test(line)) return;
+        sites.push(where);
+        // The step runs from its `- ` line to the next line indented no deeper
+        // than that dash, so `name:` before `uses:` or `with:` after it is inside.
+        let start = i;
+        while (start > 0 && !/^\s*- /.test(lines[start])) start--;
+        const dash = lines[start].search(/\S/);
         let version: string | null = null;
-        for (let j = i + 1; j < lines.length; j++) {
-          const next = lines[j];
-          if (next.trim() === "") continue;
-          if (next.search(/\S/) <= indent) break;
-          const m = next.match(/^\s*bun-version:\s*["']?([^\s"'#]+)/);
+        for (let j = start; j < lines.length; j++) {
+          const l = lines[j];
+          if (j > start && l.trim() !== "" && !isComment(l) && l.search(/\S/) <= dash) break;
+          const m = l.match(/^[\s-]*bun-version:\s*["']?([^\s"'#]+)/);
           if (m) version = m[1];
         }
-        if (version === null) unpinned.push(`${name}:${i + 1}`);
-        else pins.push(`${name}: ${version}`);
+        if (version !== null && exact.test(version)) pins.push(version);
+        else unpinned.push(where);
       });
     }
-    // Denominator first: a suite with no setup-bun steps and no pins asserts nothing.
-    expect(setupSteps.length).toBeGreaterThan(0);
+    // Denominator first: no bun sites at all would assert nothing.
+    expect(sites.length).toBeGreaterThan(0);
     expect(unpinned).toEqual([]);
-    expect(new Set(pins.map((p) => p.split(": ")[1])).size).toBe(1);
+    expect(new Set(pins).size).toBe(1);
   });
 });
